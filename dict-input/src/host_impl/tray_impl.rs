@@ -13,10 +13,11 @@ use windows::Win32::UI::Shell::{
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
     NOTIFY_ICON_DATA_FLAGS,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, KillTimer, LoadIconW,
-    PostMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu, HICON, MF_SEPARATOR, MF_STRING,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, IMAGE_ICON, KillTimer,
+    LoadIconW, LoadImageW, PostMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu, HICON,
+    LR_DEFAULTSIZE, MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
 };
 
 use crate::tray::TrayAction;
@@ -49,15 +50,13 @@ impl Tray {
 
     /// Attach the icon to `hwnd` and try to add it once.
     ///
-    /// The icon is currently the stock `IDI_APPLICATION`; the app icon resource
-    /// (`assets/dict-popup.ico`) is owned by the release-engineering agent and
-    /// is not loaded yet. See the module report.
+    /// Uses the icon resource embedded in the executable (`assets/version.rc`,
+    /// `RT_GROUP_ICON` id 1) and falls back to the stock application icon when
+    /// the resource is absent.
     pub(crate) fn init(&mut self, hwnd: HWND, tooltip: &str) {
         self.hwnd = hwnd;
         self.tip = pure::truncate_utf16(tooltip, pure::SZ_TIP_UNITS);
-        // SAFETY: with a NULL module handle IDI_APPLICATION selects a
-        // predefined system icon; the call takes no other inputs.
-        self.icon = unsafe { LoadIconW(HINSTANCE::default(), IDI_APPLICATION) }.ok();
+        self.icon = load_app_icon();
         self.retries_left = pure::TRAY_MAX_RETRIES;
         self.attempt();
     }
@@ -291,4 +290,40 @@ pub(crate) fn show_menu(hwnd: HWND) -> Option<TrayAction> {
     };
 
     pure::menu_id_to_action(chosen.0 as usize)
+}
+
+/// Load the icon embedded in the executable (`assets/version.rc`,
+/// `RT_GROUP_ICON` id 1), falling back to the stock application icon when the
+/// resource is absent (unit tests, `cargo run --example smoke`, unpackaged
+/// builds).
+fn load_app_icon() -> Option<HICON> {
+    /// `IDI_ICON1` in `assets/version.rc`.
+    const ICON_RESOURCE_ID: usize = 1;
+
+    // SAFETY: a null module handle means "this process"; the HMODULE stays
+    // valid for the process lifetime and is only read here.
+    if let Ok(module) = unsafe { GetModuleHandleW(None) } {
+        // SAFETY: MAKEINTRESOURCEW(1) encodes the integer id in the pointer
+        // bits; LoadImageW never dereferences it.
+        let name = windows::core::PCWSTR(ICON_RESOURCE_ID as *const u16);
+        // SAFETY: `name` is a valid resource id and `module` is this process's
+        // image; the returned handle is a resource icon owned by the module,
+        // which we store but never destroy (correct for image resources).
+        if let Ok(handle) = unsafe {
+            LoadImageW(
+                HINSTANCE::from(module),
+                name,
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE,
+            )
+        } {
+            return Some(HICON(handle.0));
+        }
+    }
+
+    // SAFETY: with a NULL module handle IDI_APPLICATION selects a predefined
+    // system icon; the call takes no other inputs.
+    unsafe { LoadIconW(HINSTANCE::default(), IDI_APPLICATION) }.ok()
 }

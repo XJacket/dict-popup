@@ -20,3 +20,11 @@ tools/
 screenshots/
 # old project working copy; the tracked source snapshot lives in legacy/
 /goldendict-uia-hotkey/
+
+# --- release engineering ------------------------------------------------
+# packaged output (build.bat / scripts/package.ps1)
+dist/
+# compiled resource object from assets/version.rc
+*.res
+# scratch cargo target dir used to verify builds without touching target/
+.release-check/

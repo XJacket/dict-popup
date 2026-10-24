@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "hotkey": "Ctrl+Alt+D",
+  "dictionaries": [
+    {
+      "path": "D:\\program\\GoldenDict-ng\\dicts\\ecdict\\stardict-ecdict-2.4.2.ifo",
+      "label": "ECDICT 简明英汉",
+      "enabled": true,
+      "direction": "auto"
+    }
+  ],
+  "ui": {
+    "theme": "system",
+    "font_size": 15.0,
+    "card_width": 460.0,
+    "max_card_height": 520.0,
+    "close_on_focus_lost": true,
+    "auto_hide_seconds": 0,
+    "expand_first_dictionary": true
+  },
+  "behavior": {
+    "trim_selection": true,
+    "autostart": false
+  }
+}
