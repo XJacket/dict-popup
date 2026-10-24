@@ -22,3 +22,15 @@ pub use host::{Command, Event, EventSink, Host, HostError, HostOptions};
 pub use hotkey::{Hotkey, HotkeyError, Modifiers, VirtualKey};
 pub use selection::{Selection, SelectionError};
 pub use tray::TrayAction;
+
+/// Dump the UI Automation tree of a window and what each element exposes.
+///
+/// Diagnostics only (used by `examples/uia_probe.rs` when a capture fails):
+///
+/// ```text
+/// cargo run --release --example uia_probe -- <hwnd>
+/// ```
+#[doc(hidden)]
+pub fn debug_capture_report(hwnd: isize) -> String {
+    host_impl::debug_capture_report(hwnd)
+}

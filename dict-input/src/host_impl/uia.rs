@@ -19,12 +19,14 @@ use std::thread;
 use std::time::Duration;
 
 use windows::core::IUnknown;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
-    UIA_TextPatternId, UIA_ValuePatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
+    IUIAutomationValuePattern, TreeScope_Children, TreeScope_Descendants, UIA_TextPatternId,
+    UIA_ValuePatternId,
 };
 
 use crate::host::Event;
@@ -45,7 +47,7 @@ const MAX_SELECTION_BYTES: usize = 96 * 1024;
 /// Handle to the capture pipeline. Dropping it stops the worker after its
 /// current job (a hung UIA call is left to die with the process).
 pub(crate) struct Capture {
-    requests: Option<Sender<()>>,
+    requests: Option<Sender<isize>>,
     busy: Arc<AtomicBool>,
 }
 
@@ -53,7 +55,7 @@ impl Capture {
     /// Spawn the worker and coordinator. `deliver` is called from the
     /// coordinator thread, never from the host thread.
     pub(crate) fn start(deliver: impl Fn(Event) + Send + 'static) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<()>();
+        let (request_tx, request_rx) = mpsc::channel::<isize>();
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let busy = Arc::new(AtomicBool::new(false));
 
@@ -92,7 +94,7 @@ impl Capture {
     /// * `Err(TimedOut)` — a previous capture is still running (busy-skip
     ///   policy). The caller reports it and drops this request.
     /// * `Err(Automation(..))` — the capture pipeline is not available.
-    pub(crate) fn request(&self) -> Result<(), SelectionError> {
+    pub(crate) fn request(&self, target: HWND) -> Result<(), SelectionError> {
         let Some(sender) = &self.requests else {
             return Err(SelectionError::Automation("取词线程不可用".to_string()));
         };
@@ -103,7 +105,7 @@ impl Capture {
         {
             return Err(SelectionError::TimedOut);
         }
-        if sender.send(()).is_err() {
+        if sender.send(target.0 as isize).is_err() {
             self.busy.store(false, Ordering::Release);
             return Err(SelectionError::Automation("取词线程已停止".to_string()));
         }
@@ -112,18 +114,26 @@ impl Capture {
 }
 
 struct Job {
+    /// Window the user was in when the hotkey fired (0 = unknown).
+    target: isize,
     reply: Sender<Result<Selection, SelectionError>>,
 }
 
 fn coordinator_loop(
-    requests: Receiver<()>,
+    requests: Receiver<isize>,
     jobs: Sender<Job>,
     busy: Arc<AtomicBool>,
     deliver: impl Fn(Event),
 ) {
-    while requests.recv().is_ok() {
+    while let Ok(target) = requests.recv() {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if jobs.send(Job { reply: reply_tx }).is_err() {
+        if jobs
+            .send(Job {
+                target,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             busy.store(false, Ordering::Release);
             deliver(Event::SelectionFailed(SelectionError::Automation(
                 "取词线程已停止".to_string(),
@@ -160,12 +170,13 @@ fn worker_loop(jobs: Receiver<Job>, busy: Arc<AtomicBool>) {
     let mut automation_slot: Option<IUIAutomation> = None;
 
     while let Ok(job) = jobs.recv() {
+        let target = HWND(job.target as *mut core::ffi::c_void);
         let outcome = if com_ready {
             match automation(&mut automation_slot) {
                 Ok(automation) => {
                     // SAFETY: `automation` is a live IUIAutomation interface on
                     // this MTA thread, valid for the duration of the call.
-                    unsafe { capture_with(automation) }
+                    unsafe { capture_with(automation, target) }
                 }
                 Err(error) => Err(error),
             }
@@ -208,17 +219,276 @@ fn automation(slot: &mut Option<IUIAutomation>) -> Result<&IUIAutomation, Select
         .ok_or_else(|| SelectionError::Automation("UI Automation 未初始化".to_string()))
 }
 
-/// One capture attempt against the focused element.
+/// One capture attempt.
 ///
 /// # Safety
 ///
 /// Must be called on the capture worker thread with COM initialised as MTA, and
 /// `automation` must be a live `IUIAutomation`.
-unsafe fn capture_with(automation: &IUIAutomation) -> Result<Selection, SelectionError> {
-    // SAFETY: live automation object on the owning thread.
-    let element = unsafe { automation.GetFocusedElement() }
-        .map_err(|error| SelectionError::Automation(format!("GetFocusedElement：{}", error.message())))?;
+unsafe fn capture_with(
+    automation: &IUIAutomation,
+    target: HWND,
+) -> Result<Selection, SelectionError> {
+    // Fast path: whatever UI Automation considers focused.
+    let last_error = match unsafe { automation.GetFocusedElement() } {
+        Ok(element) => match unsafe { try_element(&element) } {
+            Ok(selection) => return Ok(selection),
+            Err(error) => Some(error),
+        },
+        Err(error) => Some(SelectionError::Automation(format!(
+            "GetFocusedElement：{}",
+            error.message()
+        ))),
+    };
 
+    // Fallback: the window the user was in when the hotkey fired. WinUI/XAML
+    // hosts (Windows 11 Notepad, anything with a XAML island) report the
+    // *window* as focused; the control that owns the selection is a descendant
+    // (e.g. `Document` / `RichEditD2DPT`).
+    let mut stats = SearchStats::default();
+    if !target.is_invalid() {
+        // SAFETY: live automation object; any HWND yields an element or an error.
+        if let Ok(root) = unsafe { automation.ElementFromHandle(target) } {
+            // SAFETY: element is live on this thread.
+            if let Some(selection) = unsafe { search_text(automation, &root, &mut stats) } {
+                return Ok(selection);
+            }
+        }
+    } else {
+        stats.error = Some("没有可用的前台窗口句柄".to_string());
+    }
+
+    // Make the failure actionable instead of a bare "unsupported": the numbers
+    // say whether the tree was searched at all and how many text controls it had.
+    if let Some(error) = stats.error {
+        return Err(SelectionError::Automation(format!(
+            "已扫描 {} 个元素、{} 个文本控件：{error}",
+            stats.nodes, stats.text_elements
+        )));
+    }
+    if stats.text_elements > 0 {
+        return Err(SelectionError::EmptySelection);
+    }
+    if let Some(SelectionError::Automation(message)) = last_error {
+        return Err(SelectionError::Automation(format!(
+            "未找到可读取的文本控件（扫描 {} 个元素）：{message}",
+            stats.nodes
+        )));
+    }
+    Err(SelectionError::Automation(format!(
+        "未找到可读取的文本控件（扫描 {} 个元素）：该程序可能不通过 UI Automation 暴露选区",
+        stats.nodes
+    )))
+}
+
+#[derive(Default)]
+struct SearchStats {
+    nodes: usize,
+    text_elements: usize,
+    error: Option<String>,
+}
+
+/// The subtree search asks the provider for `Document`/`Edit` descendants only,
+/// so no walk budget is needed; the coordinator's 1.5 s timeout still bounds it.
+
+/// Diagnostic report for `examples/uia_probe.rs`: walks `hwnd` and describes
+/// every element it sees. Not used by the app.
+pub(crate) fn debug_capture_report(hwnd: isize) -> String {
+    use windows::Win32::UI::Accessibility::UIA_TextPatternId;
+
+    // SAFETY: dedicated thread, MTA initialised below; all calls are read-only.
+    unsafe {
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        // Every COM object must be released *before* CoUninitialize, hence the
+        // inner scope: dropping `automation` after uninitialising the apartment
+        // is an access violation.
+        let report = {
+            let automation: IUIAutomation = match CoCreateInstance(
+                &CUIAutomation,
+                None::<&IUnknown>,
+                CLSCTX_INPROC_SERVER,
+            ) {
+                Ok(automation) => automation,
+                Err(error) => {
+                    CoUninitialize();
+                    return format!("CoInitializeEx: {init:?}\nCoCreateInstance failed: {error}\n");
+                }
+            };
+
+            let target = HWND(hwnd as *mut core::ffi::c_void);
+            let root = match automation.ElementFromHandle(target) {
+                Ok(root) => root,
+                Err(error) => {
+                    CoUninitialize();
+                    return format!("CoInitializeEx: {init:?}\nElementFromHandle failed: {error}\n");
+                }
+            };
+
+            fn walk(
+                automation: &IUIAutomation,
+                element: &IUIAutomationElement,
+                depth: usize,
+                budget: &mut usize,
+                out: &mut String,
+            ) {
+                if depth > 6 || *budget == 0 {
+                    return;
+                }
+                *budget -= 1;
+                // SAFETY: live element on this thread.
+                unsafe {
+                    let control_type = element.CurrentControlType().map(|t| t.0).unwrap_or(-1);
+                    let class = element
+                        .CurrentClassName()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let has_text =
+                        element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId);
+                    let mut sel = String::new();
+                    if let Ok(pattern) = &has_text {
+                        if let Ok(ranges) = pattern.GetSelection() {
+                            if let Ok(n) = ranges.Length() {
+                                for i in 0..n.min(3) {
+                                    if let Ok(r) = ranges.GetElement(i) {
+                                        if let Ok(t) = r.GetText(40) {
+                                            sel.push_str(&t.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    out.push_str(&format!(
+                        "{:indent$}type={control_type} class='{class}' text={} sel={:?}\n",
+                        "",
+                        has_text.is_ok(),
+                        sel.replace('\r', "\\r").replace('\n', "\\n"),
+                        indent = depth * 2
+                    ));
+                    if let Ok(condition) = automation.CreateTrueCondition() {
+                        if let Ok(children) = element.FindAll(TreeScope_Children, &condition) {
+                            if let Ok(count) = children.Length() {
+                                for i in 0..count.clamp(0, 64) {
+                                    if let Ok(child) = children.GetElement(i) {
+                                        walk(automation, &child, depth + 1, budget, out);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut out = format!("CoInitializeEx: {init:?}\n");
+            let mut budget = 400usize;
+            walk(&automation, &root, 0, &mut budget, &mut out);
+            out
+        };
+
+        CoUninitialize();
+        report
+    }
+}
+
+/// Find a descendant whose text pattern yields a non-empty selection.
+///
+/// # Safety
+///
+/// Same contract as [`capture_with`].
+unsafe fn search_text(
+    automation: &IUIAutomation,
+    root: &IUIAutomationElement,
+    stats: &mut SearchStats,
+) -> Option<Selection> {
+    // Ask UI Automation for the text surfaces below this window instead of
+    // walking children by hand: XAML islands (Windows 11 Notepad) return
+    // nothing for FindAll(Children) but do answer a descendant query.
+    let condition = match unsafe { text_surface_condition(automation) } {
+        Ok(condition) => condition,
+        Err(message) => {
+            stats.error = Some(message);
+            return None;
+        }
+    };
+
+    // SAFETY: root is live; descendants are resolved by the provider.
+    let found = match unsafe { root.FindAll(TreeScope_Descendants, &condition) } {
+        Ok(found) => found,
+        Err(error) => {
+            stats.error = Some(format!("FindAll：{}", error.message()));
+            return None;
+        }
+    };
+    // SAFETY: live array; the count is provider data and is clamped.
+    let count = match unsafe { found.Length() } {
+        Ok(count) => count.clamp(0, 64),
+        Err(error) => {
+            stats.error = Some(format!("Length：{}", error.message()));
+            return None;
+        }
+    };
+    stats.nodes += count as usize;
+    stats.text_elements += count as usize;
+
+    for index in 0..count {
+        // SAFETY: index is within the reported range.
+        let Ok(element) = (unsafe { found.GetElement(index) }) else {
+            continue;
+        };
+        // SAFETY: element is live on this thread.
+        if let Ok(selection) = unsafe { try_element(&element) } {
+            return Some(selection);
+        }
+    }
+    None
+}
+
+/// Condition matching `Document` and `Edit` controls.
+///
+/// Only those can hold a *user* selection. A static `Text` element (a label,
+/// the window title) also implements TextPattern; accepting it looked up the
+/// title bar instead of the selected word.
+///
+/// # Safety
+///
+/// `automation` must be live on this thread.
+unsafe fn text_surface_condition(
+    automation: &IUIAutomation,
+) -> Result<windows::Win32::UI::Accessibility::IUIAutomationCondition, String> {
+    use windows::core::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationCondition, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
+        UIA_EditControlTypeId,
+    };
+
+    let document = unsafe {
+        automation.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_DocumentControlTypeId.0),
+        )
+    }
+    .map_err(|error| format!("CreatePropertyCondition(Document)：{}", error.message()))?;
+    let edit = unsafe {
+        automation.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_EditControlTypeId.0),
+        )
+    }
+    .map_err(|error| format!("CreatePropertyCondition(Edit)：{}", error.message()))?;
+
+    let condition: IUIAutomationCondition =
+        unsafe { automation.CreateOrCondition(&document, &edit) }
+            .map_err(|error| format!("CreateOrCondition：{}", error.message()))?;
+    Ok(condition)
+}
+
+/// Try the text pattern, then the value pattern, on one element.
+///
+/// # Safety
+///
+/// `element` must be a live UI Automation element on this thread.
+unsafe fn try_element(element: &IUIAutomationElement) -> Result<Selection, SelectionError> {
     // SAFETY: `element` is alive for the whole function; the pattern is queried
     // through the element's own vtable.
     match unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) } {
@@ -229,7 +499,9 @@ unsafe fn capture_with(automation: &IUIAutomation) -> Result<Selection, Selectio
             })?;
             // SAFETY: `ranges` is a live range array owned by the pattern call.
             let count = unsafe { ranges.Length() }
-                .map_err(|error| SelectionError::Automation(format!("RangeArray.Length：{}", error.message())))?
+                .map_err(|error| {
+                    SelectionError::Automation(format!("RangeArray.Length：{}", error.message()))
+                })?
                 .clamp(0, MAX_RANGES);
 
             let mut pieces = Vec::with_capacity(count as usize);
@@ -257,7 +529,14 @@ unsafe fn capture_with(automation: &IUIAutomation) -> Result<Selection, Selectio
                     let text = unsafe { value.CurrentValue() }.map_err(|error| {
                         SelectionError::Automation(format!("ValuePattern.CurrentValue：{}", error.message()))
                     })?;
-                    join_pieces(&[text.to_string()])
+                    let text = text.to_string();
+                    // A ValuePattern exposes the *whole* content, not the
+                    // selection. Looking up a 4000-character document would be
+                    // wrong (and noisy), so treat anything long as "no selection".
+                    if text.chars().count() > 200 {
+                        return Err(SelectionError::EmptySelection);
+                    }
+                    join_pieces(&[text])
                 }
                 Err(_) => Err(SelectionError::NoTextPattern),
             }

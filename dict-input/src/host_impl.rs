@@ -26,6 +26,11 @@ mod tray_impl;
 mod uia;
 mod win32_util;
 
+/// Diagnostics for the capture path, exposed through `dict_input::debug_capture_report`.
+pub(crate) fn debug_capture_report(hwnd: isize) -> String {
+    uia::debug_capture_report(hwnd)
+}
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -48,11 +53,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
-    GetWindowLongPtrW, IsWindow, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA,
-    HCURSOR, HICON, HMENU, WNDCLASSW, WINDOW_EX_STYLE, WM_DESTROY, WM_ENDSESSION,
-    WM_HOTKEY, WM_NCCREATE, WM_QUERYENDSESSION, WM_TIMER, WNDCLASS_STYLES, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage,
+    CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HICON, HMENU, WNDCLASSW, WINDOW_EX_STYLE, WM_DESTROY,
+    WM_ENDSESSION, WM_HOTKEY, WM_NCCREATE, WM_QUERYENDSESSION, WM_TIMER, WNDCLASS_STYLES,
+    WS_OVERLAPPED,
 };
 
 use crate::host::{Command, Event, EventSink, Host, HostError, HostOptions};
@@ -159,6 +165,10 @@ struct HostState {
     hotkey: Option<Hotkey>,
     show_settings_message: u32,
     taskbar_created_message: u32,
+    /// Test hook: `DICT_POPUP_CAPTURE_HWND=<hwnd>` forces the capture target
+    /// instead of the foreground window, so the UIA path can be tested without
+    /// being able to steal foreground focus from an automated session.
+    capture_override: Option<isize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +335,9 @@ fn host_thread(
         hotkey: None,
         show_settings_message,
         taskbar_created_message,
+        capture_override: std::env::var("DICT_POPUP_CAPTURE_HWND")
+            .ok()
+            .and_then(|value| value.trim().parse::<isize>().ok()),
     });
     let state_ptr = Box::into_raw(state);
 
@@ -695,8 +708,18 @@ unsafe fn on_hotkey(state: *mut HostState, wparam: WPARAM) {
 
     ((*state).sink)(Event::Hotkey);
 
+    // Remember *which window* the user was working in. UIA's "focused element"
+    // is unreliable across toolkits (WinUI/XAML apps often report the top-level
+    // window, which exposes no text pattern), so the target window is captured
+    // here and searched for a text element by the worker.
+    let target = match (*state).capture_override {
+        Some(hwnd) => HWND(hwnd as *mut core::ffi::c_void),
+        // SAFETY: no arguments; returns the foreground window or null.
+        None => unsafe { GetForegroundWindow() },
+    };
+
     let request = match &mut (*state).capture {
-        Some(capture) => capture.request(),
+        Some(capture) => capture.request(target),
         None => Err(SelectionError::Automation("取词服务未启动".to_string())),
     };
     if let Err(error) = request {
