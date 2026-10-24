@@ -93,7 +93,10 @@ impl Dictionary {
         let dict = MappedFile::open(&dict_path)?;
 
         let started = std::time::Instant::now();
-        let offsets = build_offsets(idx.as_slice());
+        // Stream the index instead of touching it through the mapping: mapping
+        // 82 MB of records makes those pages resident and inflates the working
+        // set by that much, which we cannot afford (100 MB budget).
+        let offsets = scan_offsets(&idx_path, 1 << 20)?;
         let scan_micros = started.elapsed().as_micros();
 
         Ok(Self {
@@ -196,26 +199,53 @@ impl Dictionary {
     }
 }
 
-fn build_offsets(idx: &[u8]) -> Vec<u32> {
-    // Roughly one record per 24 bytes; pre-reserving avoids repeated growth on
-    // a 3.4M-record index.
-    let mut offsets = Vec::with_capacity(idx.len() / 24 + 16);
-    let mut pos = 0usize;
-    while pos < idx.len() {
-        match idx[pos..].iter().position(|&b| b == 0) {
-            Some(rel) => {
-                let nul = pos + rel;
-                // A record needs 8 more bytes after the terminator.
-                if nul + 9 > idx.len() {
-                    break;
-                }
-                offsets.push(pos as u32);
-                pos = nul + 9;
+fn scan_offsets(path: &Path, chunk_size: usize) -> io::Result<Vec<u32>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    // Roughly one record per 24 bytes.
+    let expected = file.metadata().map(|m| m.len() as usize / 24).unwrap_or(0);
+    let mut reader = std::io::BufReader::with_capacity(chunk_size, file);
+    let mut offsets: Vec<u32> = Vec::with_capacity(expected + 16);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let mut base: u64 = 0; // file offset of buf[0]
+    let mut cur: usize = 0; // parse cursor inside buf
+    let mut chunk = vec![0u8; chunk_size];
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        let eof = read == 0;
+        if !eof {
+            buf.extend_from_slice(&chunk[..read]);
+        }
+
+        // Parse every complete record currently buffered.
+        loop {
+            let Some(rel) = buf[cur..].iter().position(|&b| b == 0) else {
+                break;
+            };
+            let nul = cur + rel;
+            // A record is headword | NUL | u32 | u32.
+            if buf.len() < nul + 9 {
+                break;
             }
-            None => break,
+            offsets.push((base + cur as u64) as u32);
+            cur = nul + 9;
+        }
+
+        if cur > 0 {
+            buf.drain(0..cur);
+            base += cur as u64;
+            cur = 0;
+        }
+
+        if eof {
+            break;
         }
     }
-    offsets
+
+    Ok(offsets)
 }
 
 fn parse_ifo(text: &str) -> IfoInfo {
@@ -320,7 +350,13 @@ mod tests {
             idx.extend_from_slice(&(definition.len() as u32).to_be_bytes());
         }
 
-        let dir = std::env::temp_dir().join(format!(
+        // NOT std::env::temp_dir(): on this machine the process token cannot
+        // create directories under %TEMP% (another sandbox owns its ACL).
+        // The crate's own target/ directory is always writable.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        let dir = base.join(format!(
             "dict-core-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -414,5 +450,20 @@ mod tests {
         let t = sample();
         let d = Dictionary::open(t.dir.join("testdict.ifo")).unwrap();
         assert_eq!(d.offsets_bytes(), d.entry_count() * 4);
+    }
+
+    #[test]
+    fn streamed_scan_is_chunk_size_independent() {
+        let t = sample();
+        let idx = t.dir.join("testdict.idx");
+
+        let big = scan_offsets(&idx, 1 << 20).unwrap();
+        let small = scan_offsets(&idx, 7).unwrap();
+        let tiny = scan_offsets(&idx, 1).unwrap();
+
+        assert_eq!(big, small, "chunk boundary changed the offsets");
+        assert_eq!(big, tiny, "byte-at-a-time scan disagrees");
+        assert_eq!(big.len(), 5);
+        assert_eq!(big[0], 0, "first record must start at offset 0");
     }
 }

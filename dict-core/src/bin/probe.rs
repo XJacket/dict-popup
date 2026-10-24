@@ -95,4 +95,12 @@ fn main() {
         words.len(),
         total_us / words.len() as f64
     );
+
+    // `--hold <secs>`: stay alive so an external profiler can sample memory.
+    if let Ok(hold) = std::env::var("DICT_PROBE_HOLD_SECS") {
+        if let Ok(secs) = hold.parse::<u64>() {
+            println!("holding for {secs}s for memory sampling (pid {})", std::process::id());
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    }
 }
