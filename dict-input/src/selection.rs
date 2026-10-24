@@ -24,7 +24,10 @@ pub enum SelectionError {
 impl fmt::Display for SelectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SelectionError::NoTextPattern => write!(f, "当前程序不支持取词"),
+            SelectionError::NoTextPattern => write!(
+                f,
+                "当前程序不支持取词（需要能用鼠标选中文字的应用，例如浏览器、记事本、Office）"
+            ),
             SelectionError::EmptySelection => write!(f, "没有选中文字"),
             SelectionError::Automation(m) => write!(f, "取词失败：{m}"),
             SelectionError::TimedOut => write!(f, "取词超时"),

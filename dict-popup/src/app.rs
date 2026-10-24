@@ -80,6 +80,12 @@ pub struct Shared {
     pub settings: SettingsState,
     pub host: Option<Host>,
     pub host_error: Option<String>,
+    /// A hotkey fired and the UIA capture is still in flight. The card is shown
+    /// only when the result arrives (see `on_hotkey`), or by the watchdog.
+    pending_hotkey: Option<Instant>,
+    /// The user dismissed the card while a capture was still running; its
+    /// result must not reopen the card (the host cannot cancel a capture).
+    ignore_result: bool,
 }
 
 impl Shared {
@@ -142,8 +148,7 @@ impl Shared {
             Event::Hotkey => self.on_hotkey(),
             Event::Selection(selection) => self.on_selection(selection.text),
             Event::SelectionFailed(err) => {
-                self.card.show_error(err.to_string());
-                self.wake();
+                self.on_selection_failed(err.to_string());
             }
             Event::HotkeyFailed(message) => {
                 // The old hotkey (if any) is still active; surface the reason in
@@ -171,12 +176,57 @@ impl Shared {
     }
 
     fn on_hotkey(&mut self) {
-        self.card.begin_query(&self.config.ui);
+        // While the card is up it holds focus, so UIA could only read our own
+        // window. Treat a second press as "dismiss" (the footer says the same).
+        if self.card.visible {
+            self.card.visible = false;
+            // The host captures on every hotkey and cannot cancel it, so this
+            // press always has a result in flight; drop it so the card does not
+            // immediately reopen.
+            self.pending_hotkey = None;
+            self.ignore_result = true;
+            logging::info("hotkey (dismiss)");
+            self.wake();
+            return;
+        }
+
+        // Do NOT show the card yet. A visible card takes focus, and the UIA
+        // worker runs ~10-200 ms later: it would then read *our* window instead
+        // of the user's, which is exactly the "当前程序不支持取词" report.
+        // The card is shown when the selection (or the failure) arrives, with a
+        // watchdog in `logic` that shows "查询中" if capture is slow.
+        self.pending_hotkey = Some(Instant::now());
         logging::info("hotkey");
         self.wake();
     }
 
+    /// Show the card for this pass: position it, then reveal `phase`.
+    fn show_card(&mut self, phase: impl FnOnce(&mut CardState)) {
+        self.pending_hotkey = None;
+        let ui_config = self.config.ui.clone();
+        self.card.begin_query(&ui_config);
+        phase(&mut self.card);
+        self.wake();
+    }
+
+    fn on_selection_failed(&mut self, message: String) {
+        if self.ignore_result {
+            self.ignore_result = false;
+            self.pending_hotkey = None;
+            return;
+        }
+        self.show_card(|card| card.show_error(message));
+    }
+
     fn on_selection(&mut self, text: String) {
+        if self.ignore_result {
+            self.ignore_result = false;
+            return;
+        }
+        self.pending_hotkey = None;
+        let ui_config = self.config.ui.clone();
+        self.card.begin_query(&ui_config);
+
         let query = if self.config.behavior.trim_selection {
             text.trim().to_string()
         } else {
@@ -461,6 +511,8 @@ impl App {
             settings: SettingsState::default(),
             host: startup.host,
             host_error: startup.host_error.clone(),
+            pending_hotkey: None,
+            ignore_result: false,
         };
 
         if let Some(message) = &shared.config_error {
@@ -526,6 +578,19 @@ impl eframe::App for App {
         shared.poll_registry();
         shared.maybe_commit_config(Instant::now());
 
+        // Watchdog: only if the capture is genuinely slow. Opening the card
+        // earlier would steal focus *while UIA is still reading*, which is the
+        // exact failure we removed: a typical capture is tens of milliseconds,
+        // so in practice the card appears with the result and never mid-capture.
+        if let Some(started) = shared.pending_hotkey {
+            if started.elapsed() >= std::time::Duration::from_millis(1200) {
+                shared.pending_hotkey = None;
+                let ui_config = shared.config.ui.clone();
+                shared.card.begin_query(&ui_config);
+                shared.wake();
+            }
+        }
+
         // `--demo`: wait for the registry, then show the card as if the hotkey
         // had fired. Deliberately one-shot.
         if let Some(word) = self.demo.take() {
@@ -581,13 +646,18 @@ impl eframe::App for App {
         };
 
         // The builder's `with_visible` only takes effect at viewport creation;
-        // push every later transition as an explicit command.
+        // push every later transition as an explicit command. A hidden window is
+        // only painted when it has a pending repaint (eframe's
+        // check_redraw_requests skips idle invisible windows), so the wake is
+        // what actually lets `Visible(true)` be processed.
         if card_visible != self.card_visible_sent {
             ctx.send_viewport_cmd_to(card_id, ViewportCommand::Visible(card_visible));
+            ctx.request_repaint_of(card_id);
             self.card_visible_sent = card_visible;
         }
         if settings_visible != self.settings_visible_sent {
             ctx.send_viewport_cmd_to(settings_id, ViewportCommand::Visible(settings_visible));
+            ctx.request_repaint_of(settings_id);
             self.settings_visible_sent = settings_visible;
         }
 
