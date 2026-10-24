@@ -1,11 +1,14 @@
 # dict-popup
 
 **离线划词词典。** 选中任意程序里的文字，按一次热键，鼠标旁弹出释义卡片。
-不联网、不启动 GoldenDict、**不碰剪贴板**，单文件 exe，解压即用。
+不联网、不启动 GoldenDict，单文件 exe，解压即用。
 
 - 取代 `legacy/goldendict-uia-hotkey`（旧工具只负责把词丢给 GoldenDict）。
 - 词典用本地 [StarDict](https://en.wikipedia.org/wiki/StarDict) 格式（ECDICT 等）。
-- 取词走 Windows UI Automation，通过 `UIA_TextPattern` 读取选区，不发送合成按键。
+- **取词方式**：按下热键后模拟一次 `Ctrl+C` 读取选中文字（与 Pot 相同），随后立即把你原来的
+  剪贴板**文本**还原。这是目前在各类程序里最可靠的方式；代价是这一瞬间剪贴板被占用，
+  且原来若是图片/文件（非文本）无法还原。目标程序支持 UI Automation 时也可走 UIA 路径
+  （`DICT_POPUP_CAPTURE_MODE=uia` 强制，`=clipboard` 强制走剪贴板）。
 
 ## 安装
 

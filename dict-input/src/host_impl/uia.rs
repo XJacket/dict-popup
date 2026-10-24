@@ -32,6 +32,8 @@ use windows::Win32::UI::Accessibility::{
 use crate::host::Event;
 use crate::selection::{Selection, SelectionError};
 
+use super::clipboard;
+
 /// Hard budget for one capture request (docs/DESIGN.md §3 / task spec).
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -171,21 +173,19 @@ fn worker_loop(jobs: Receiver<Job>, busy: Arc<AtomicBool>) {
 
     while let Ok(job) = jobs.recv() {
         let target = HWND(job.target as *mut core::ffi::c_void);
-        let outcome = if com_ready {
-            match automation(&mut automation_slot) {
-                Ok(automation) => {
-                    // SAFETY: `automation` is a live IUIAutomation interface on
-                    // this MTA thread, valid for the duration of the call.
-                    unsafe { capture_with(automation, target) }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            Err(SelectionError::Automation(format!(
-                "COM 初始化失败（HRESULT 0x{:08X}）",
-                init.0
-            )))
-        };
+        // Clipboard first (what Pot does: works in every app the user can select
+        // text in), UI Automation as the fallback that does not touch the
+        // clipboard. `DICT_POPUP_CAPTURE_MODE=uia|clipboard` overrides.
+        let mode = std::env::var("DICT_POPUP_CAPTURE_MODE").unwrap_or_default();
+        let prefer_clipboard = mode != "uia";
+
+        let outcome = capture_job(
+            &mut automation_slot,
+            com_ready,
+            target,
+            prefer_clipboard,
+            init,
+        );
 
         // The worker decides when it is free again, not the coordinator: a
         // timed-out request must leave the busy flag set while UIA is still
@@ -201,8 +201,46 @@ fn worker_loop(jobs: Receiver<Job>, busy: Arc<AtomicBool>) {
     }
 }
 
-fn automation(slot: &mut Option<IUIAutomation>) -> Result<&IUIAutomation, SelectionError> {
-    if slot.is_none() {
+/// One capture job: clipboard first (unless disabled), UI Automation second.
+fn capture_job(
+    automation_slot: &mut Option<IUIAutomation>,
+    com_ready: bool,
+    target: HWND,
+    prefer_clipboard: bool,
+    init: windows::core::HRESULT,
+) -> Result<Selection, SelectionError> {
+    let mut clipboard_error = None;
+
+    if prefer_clipboard {
+        match clipboard::capture() {
+            Ok(selection) => return Ok(selection),
+            Err(error) => clipboard_error = Some(error),
+        }
+    }
+
+    if com_ready {
+        match automation(automation_slot) {
+            Ok(automation) => match unsafe { capture_with(automation, target) } {
+                Ok(selection) => return Ok(selection),
+                Err(error) => {
+                    return Err(match clipboard_error {
+                        Some(clip) => {
+                            SelectionError::Automation(format!("{}；UI Automation：{}", clip, error))
+                        }
+                        None => error,
+                    });
+                }
+            },
+            Err(error) => return Err(clipboard_error.unwrap_or(error)),
+        }
+    }
+
+    Err(clipboard_error.unwrap_or_else(|| {
+        SelectionError::Automation(format!("COM 初始化失败（HRESULT 0x{:08X}）", init.0))
+    }))
+}
+
+fn automation(slot: &mut Option<IUIAutomation>) -> Result<&IUIAutomation, SelectionError> {    if slot.is_none() {
         // SAFETY: COM is initialised on this thread and CUIAutomation is the
         // in-process UI Automation coclass; no outer object is needed.
         let created: IUIAutomation =

@@ -34,3 +34,15 @@ pub use tray::TrayAction;
 pub fn debug_capture_report(hwnd: isize) -> String {
     host_impl::debug_capture_report(hwnd)
 }
+
+/// Read the clipboard text (diagnostics only).
+#[doc(hidden)]
+pub fn debug_clipboard_read() -> Option<String> {
+    host_impl::debug_clipboard_read()
+}
+
+/// Write the clipboard text (diagnostics only; replaces the current text).
+#[doc(hidden)]
+pub fn debug_clipboard_write(text: &str) {
+    host_impl::debug_clipboard_write(text)
+}

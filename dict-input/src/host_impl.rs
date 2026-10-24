@@ -21,6 +21,7 @@
 //! it cannot, `start` still succeeds and the DPI call becomes a no-op.
 
 mod autostart_impl;
+mod clipboard;
 mod pure;
 mod tray_impl;
 mod uia;
@@ -29,6 +30,14 @@ mod win32_util;
 /// Diagnostics for the capture path, exposed through `dict_input::debug_capture_report`.
 pub(crate) fn debug_capture_report(hwnd: isize) -> String {
     uia::debug_capture_report(hwnd)
+}
+
+pub(crate) fn debug_clipboard_read() -> Option<String> {
+    clipboard::read_text()
+}
+
+pub(crate) fn debug_clipboard_write(text: &str) {
+    clipboard::write_text(text);
 }
 
 use std::collections::VecDeque;

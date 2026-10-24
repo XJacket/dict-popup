@@ -794,7 +794,7 @@ fn about_section(ui: &mut egui::Ui, shared: &mut Shared) {
         ui.strong("关于");
         ui.add_space(4.0);
         ui.label(format!(
-            "dict-popup {} · 完全离线 · 不读写剪贴板 · 日志只记录选中文字长度",
+            "dict-popup {} · 完全离线 · 取词时短暂使用剪贴板并还原 · 日志只记录文字长度",
             env!("CARGO_PKG_VERSION")
         ));
 

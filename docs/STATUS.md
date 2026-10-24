@@ -33,6 +33,21 @@
 
 ## 已修复缺陷（0.1.0 发布前）
 
+### 取词在各类程序中全部失败（2026-10-25）
+
+**结论**：UIA 路线在 Windows 11 记事本（XAML）、Electron、自绘程序里不可靠——顶层窗口没有
+文本模式，真正的控件藏在子树里，而部分提供程序连 `FindAll(Descendants)` 都不返回内容。
+
+**改为 Pot 的做法**：热键后
+1. 备份剪贴板文本；
+2. **等 Ctrl/Alt/Shift/Win 松开**（热键是 Ctrl+Alt+D，不等待的话目标程序看到的是 `Ctrl+Alt+C`）；
+3. 合成 `Ctrl+C`，轮询剪贴板序列号，最长 450 ms；
+4. 读取 `CF_UNICODETEXT`，**立即还原原剪贴板文本**；
+5. 失败时才回退到 UIA。
+
+环境变量 `DICT_POPUP_CAPTURE_MODE=uia|clipboard` 可强制单一路径（默认先剪贴板后 UIA）。
+剪贴板读写的往返已由 `dict-input/examples/clipboard_probe.rs` 实测通过。
+
 ### 热键按下后卡片不出现（2026-10-24）
 
 **症状**：按热键听到提示音，屏幕上看不到卡片。
