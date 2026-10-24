@@ -5,21 +5,37 @@ edition = "2021"
 description = "Offline dictionary lookup with a modern floating card"
 
 [dependencies]
-# UI
-eframe = "0.37"
+# UI. The glow (OpenGL) backend is pinned deliberately: the default wgpu backend
+# on this machine costs ~236 MB working set / 52 threads, which blows the 100 MB
+# budget in docs/DESIGN.md §2. glow measured ~90 MB / 13 threads.
+# system_fonts and accesskit are intentionally *off*: the CJK font is loaded by
+# us from C:\Windows\Fonts (see src/theme.rs) and there is no screen-reader layer.
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "clipboard",
+    "links",
+] }
 egui = "0.37"
 
 # config + logs
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Win32: hotkey, UIA selection, tray, memory-mapped dictionary files
+# local crates: StarDict reading, Win32 host (hotkey / UIA / tray / single instance)
+dict-core = { path = "../dict-core" }
+dict-input = { path = "../dict-input" }
+
+# Win32: cursor/monitor work area + DPI, shell open, message box
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

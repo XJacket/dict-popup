@@ -43,12 +43,20 @@ pub struct Lookup {
     pub attempts: usize,
 }
 
+/// One anchor every N records. Storing an offset per record costs 4 bytes x
+/// 3.4M = 13.6 MB of private memory; an anchor every 32 records costs 0.43 MB
+/// and at most 32 sequential record comparisons per lookup (a few microseconds).
+const ANCHOR_STRIDE: usize = 32;
+
 pub struct Dictionary {
     pub path: PathBuf,
     pub ifo: IfoInfo,
     idx: MappedFile,
     dict: MappedFile,
-    offsets: Vec<u32>,
+    /// File offset of every `ANCHOR_STRIDE`-th record.
+    anchors: Vec<u32>,
+    /// Total record count (not the anchor count).
+    count: usize,
     scan_micros: u128,
 }
 
@@ -96,7 +104,7 @@ impl Dictionary {
         // Stream the index instead of touching it through the mapping: mapping
         // 82 MB of records makes those pages resident and inflates the working
         // set by that much, which we cannot afford (100 MB budget).
-        let offsets = scan_offsets(&idx_path, 1 << 20)?;
+        let (anchors, count) = scan_offsets(&idx_path, 1 << 20)?;
         let scan_micros = started.elapsed().as_micros();
 
         Ok(Self {
@@ -104,13 +112,14 @@ impl Dictionary {
             ifo,
             idx,
             dict,
-            offsets,
+            anchors,
+            count,
             scan_micros,
         })
     }
 
     pub fn entry_count(&self) -> usize {
-        self.offsets.len()
+        self.count
     }
 
     pub fn scan_micros(&self) -> u128 {
@@ -121,18 +130,30 @@ impl Dictionary {
         self.idx.len()
     }
 
-    /// Offset table size in bytes (u32 per entry).
+    /// Anchor table size in bytes.
     pub fn offsets_bytes(&self) -> usize {
-        self.offsets.len() * std::mem::size_of::<u32>()
+        self.anchors.len() * std::mem::size_of::<u32>()
     }
 
-    fn record_at(&self, i: usize) -> Option<(&[u8], u32, u32)> {
-        let start = *self.offsets.get(i)? as usize;
+    /// Parse the record starting at `start`; returns the next record position.
+    fn record_at_offset(&self, start: usize) -> Option<(&[u8], u32, u32, usize)> {
         let idx = self.idx.as_slice();
-        let end = idx[start..].iter().position(|&b| b == 0)? + start;
+        let tail = idx.get(start..)?;
+        let end = start + tail.iter().position(|&b| b == 0)?;
         let word = &idx[start..end];
         let off = u32::from_be_bytes(idx.get(end + 1..end + 5)?.try_into().ok()?);
         let size = u32::from_be_bytes(idx.get(end + 5..end + 9)?.try_into().ok()?);
+        Some((word, off, size, end + 9))
+    }
+
+    fn record_at(&self, i: usize) -> Option<(&[u8], u32, u32)> {
+        let block = i / ANCHOR_STRIDE;
+        let skip = i % ANCHOR_STRIDE;
+        let mut pos = *self.anchors.get(block)? as usize;
+        for _ in 0..skip {
+            pos = self.record_at_offset(pos)?.3;
+        }
+        let (word, off, size, _) = self.record_at_offset(pos)?;
         Some((word, off, size))
     }
 
@@ -164,19 +185,36 @@ impl Dictionary {
     pub fn lookup_exact(&self, term: &str) -> Option<Entry> {
         // Fold the query the same way dictionary headwords are folded.
         let query: Vec<u8> = term.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let (mut lo, mut hi) = (0usize, self.offsets.len());
+        if self.anchors.is_empty() {
+            return None;
+        }
+
+        // Last anchor whose record sorts <= the query.
+        let (mut lo, mut hi) = (0usize, self.anchors.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let (word, off, size) = self.record_at(mid)?;
+            let (word, _, _, _) = self.record_at_offset(self.anchors[mid] as usize)?;
+            if cmp_ascii_lower(word, &query) == Ordering::Greater {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let block = lo.saturating_sub(1);
+
+        // Scan that block (at most ANCHOR_STRIDE records).
+        let mut pos = self.anchors[block] as usize;
+        for _ in 0..ANCHOR_STRIDE {
+            let (word, off, size, next) = self.record_at_offset(pos)?;
             match cmp_ascii_lower(word, &query) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Greater => hi = mid,
                 Ordering::Equal => {
                     return Some(Entry {
                         headword: String::from_utf8_lossy(word).into_owned(),
                         definition: self.read_definition(off, size),
                     })
                 }
+                Ordering::Greater => return None,
+                Ordering::Less => pos = next,
             }
         }
         None
@@ -199,14 +237,17 @@ impl Dictionary {
     }
 }
 
-fn scan_offsets(path: &Path, chunk_size: usize) -> io::Result<Vec<u32>> {
+/// Scan `.idx` and record the file offset of every `ANCHOR_STRIDE`-th record,
+/// plus the total record count.
+fn scan_offsets(path: &Path, chunk_size: usize) -> io::Result<(Vec<u32>, usize)> {
     use std::io::Read;
 
     let file = std::fs::File::open(path)?;
     // Roughly one record per 24 bytes.
     let expected = file.metadata().map(|m| m.len() as usize / 24).unwrap_or(0);
     let mut reader = std::io::BufReader::with_capacity(chunk_size, file);
-    let mut offsets: Vec<u32> = Vec::with_capacity(expected + 16);
+    let mut anchors: Vec<u32> = Vec::with_capacity(expected / ANCHOR_STRIDE + 16);
+    let mut count: usize = 0;
 
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
     let mut base: u64 = 0; // file offset of buf[0]
@@ -230,7 +271,10 @@ fn scan_offsets(path: &Path, chunk_size: usize) -> io::Result<Vec<u32>> {
             if buf.len() < nul + 9 {
                 break;
             }
-            offsets.push((base + cur as u64) as u32);
+            if count % ANCHOR_STRIDE == 0 {
+                anchors.push((base + cur as u64) as u32);
+            }
+            count += 1;
             cur = nul + 9;
         }
 
@@ -245,7 +289,7 @@ fn scan_offsets(path: &Path, chunk_size: usize) -> io::Result<Vec<u32>> {
         }
     }
 
-    Ok(offsets)
+    Ok((anchors, count))
 }
 
 fn parse_ifo(text: &str) -> IfoInfo {
@@ -446,10 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn offsets_table_matches_entry_count() {
+    fn anchor_table_is_sparse() {
         let t = sample();
         let d = Dictionary::open(t.dir.join("testdict.ifo")).unwrap();
-        assert_eq!(d.offsets_bytes(), d.entry_count() * 4);
+        assert_eq!(d.entry_count(), 5);
+        let max_anchors = d.entry_count() / ANCHOR_STRIDE + 1;
+        assert!(
+            d.offsets_bytes() <= max_anchors * 4,
+            "anchor table must not grow with the record count"
+        );
     }
 
     #[test]
@@ -457,13 +506,36 @@ mod tests {
         let t = sample();
         let idx = t.dir.join("testdict.idx");
 
-        let big = scan_offsets(&idx, 1 << 20).unwrap();
-        let small = scan_offsets(&idx, 7).unwrap();
-        let tiny = scan_offsets(&idx, 1).unwrap();
+        let (big, big_count) = scan_offsets(&idx, 1 << 20).unwrap();
+        let (small, small_count) = scan_offsets(&idx, 7).unwrap();
+        let (tiny, tiny_count) = scan_offsets(&idx, 1).unwrap();
 
-        assert_eq!(big, small, "chunk boundary changed the offsets");
+        assert_eq!(big, small, "chunk boundary changed the anchors");
         assert_eq!(big, tiny, "byte-at-a-time scan disagrees");
-        assert_eq!(big.len(), 5);
+        assert_eq!(big_count, 5);
+        assert_eq!(small_count, 5);
+        assert_eq!(tiny_count, 5);
         assert_eq!(big[0], 0, "first record must start at offset 0");
+    }
+
+    #[test]
+    fn lookups_work_across_anchor_blocks() {
+        // 100 records force several anchors; every headword must still resolve.
+        let entries: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("word{i:03}"), format!("def {i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(w, d)| (w.as_str(), d.as_str()))
+            .collect();
+        let t = build_temp(&refs);
+        let d = Dictionary::open(t.dir.join("testdict.ifo")).unwrap();
+        assert_eq!(d.entry_count(), 100);
+        for (word, def) in &entries {
+            let hit = d.lookup_exact(word).unwrap_or_else(|| panic!("miss {word}"));
+            assert_eq!(&hit.definition, def);
+        }
+        assert!(d.lookup_exact("word999").is_none());
+        assert!(d.lookup_exact("wordaa0").is_none());
     }
 }
