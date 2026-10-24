@@ -1,0 +1,22 @@
+# --- build output -------------------------------------------------------
+target/
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# --- dependency cache created by fetch-deps.bat -------------------------
+.cargo-home/
+
+# --- local scratch ------------------------------------------------------
+*.log
+.dsh-build-gd/
+
+# --- not part of this project -------------------------------------------
+# 12k-file MinGW toolchain
+tools/
+# reference screenshots
+screenshots/
+# old project working copy; the tracked source snapshot lives in legacy/
+/goldendict-uia-hotkey/
