@@ -31,6 +31,29 @@
 > （实测跑到 Lightroom 里开了右键菜单）。因此交互类验收必须人工执行，`scripts\e2e-smoke.ps1`
 > 与 `--demo <词>` 只覆盖"查询 → 渲染"这一段。
 
+## 已修复缺陷（0.1.0 发布前）
+
+### 热键按下后卡片不出现（2026-10-24）
+
+**症状**：按热键听到提示音，屏幕上看不到卡片。
+
+**两个独立原因**：
+1. **旧工具占用热键**：`goldendict-uia-hotkey.exe` 仍在运行并持有 `Ctrl+Alt+D`，响应的是它（它取词失败时只响铃、不弹窗）。该程序不在启动项里，属于手动遗留进程。
+2. **卡片视口可见性缺陷**：`ViewportBuilder::with_visible()` 只在视口**创建**时生效。卡片视口在启动时以「隐藏」创建，之后热键把它置为可见时没有任何 `ViewportCommand::Visible(true)` 发出，于是窗口存在、位置尺寸正确，但永远 `IsWindowVisible == false`。`--demo` 能看见是因为它在首次 `ui()` 之前就置了可见，正好赶上创建。
+
+**修复**：`App::ui` 里显式跟踪并推送两个子视口（卡片 / 设置）的可见性变化
+（`src/app.rs` 的 `card_visible_sent` / `settings_visible_sent`）。
+
+**回归验证方式**（无需人工按键）：向宿主窗口投递 `WM_HOTKEY`，然后断言卡片窗口可见：
+
+```powershell
+$host = 找到类名 'DictPopupInputHost' 的窗口
+PostMessage($host, 0x0312, 热键id, 0)
+# 期望：出现一个 class='Window Class'、标题 'dict-popup'、500x202、IsWindowVisible=True 的窗口
+```
+
+投递 `WM_KEYDOWN VK_ESCAPE` 到该窗口 → 应回到 `visible=False`。两条均已实测通过。
+
 ## 已知限制
 
 - 仅支持 StarDict（`.ifo` + `.idx` + 未压缩 `.dict`）；`.dict.dz` 明确报"不支持压缩词典"。

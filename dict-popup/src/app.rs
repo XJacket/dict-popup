@@ -413,6 +413,15 @@ pub struct App {
     demo: Option<String>,
     /// Working-set trimming bookkeeping (see `logic`).
     card_was_visible: bool,
+    /// Last visibility we explicitly pushed to each child viewport.
+    ///
+    /// `ViewportBuilder::with_visible` is applied **only when the viewport is
+    /// created**. The card viewport is created hidden at startup, so a later
+    /// `visible = true` in the builder does nothing: the transition has to be
+    /// sent as `ViewportCommand::Visible`. Without this the card never appears
+    /// after the first hotkey (the window exists, 500x202, but is invisible).
+    card_visible_sent: bool,
+    settings_visible_sent: bool,
 }
 
 /// Everything `main` prepared before eframe existed: the config (loaded early so
@@ -498,6 +507,8 @@ impl App {
             events: startup.events,
             demo: startup.demo,
             card_was_visible: false,
+            card_visible_sent: false,
+            settings_visible_sent: false,
         }
     }
 
@@ -568,6 +579,17 @@ impl eframe::App for App {
                 focus_settings,
             )
         };
+
+        // The builder's `with_visible` only takes effect at viewport creation;
+        // push every later transition as an explicit command.
+        if card_visible != self.card_visible_sent {
+            ctx.send_viewport_cmd_to(card_id, ViewportCommand::Visible(card_visible));
+            self.card_visible_sent = card_visible;
+        }
+        if settings_visible != self.settings_visible_sent {
+            ctx.send_viewport_cmd_to(settings_id, ViewportCommand::Visible(settings_visible));
+            self.settings_visible_sent = settings_visible;
+        }
 
         // The card: frameless, translucent, always on top, never in the taskbar.
         let shared_for_card = Arc::clone(&self.shared);
