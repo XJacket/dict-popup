@@ -58,6 +58,10 @@
 - Capture 线程：UIA 取词，`COINIT_MULTITHREADED`；带 1.5 s 软超时；超时只丢弃本次并回调 `SelectionFailed(TimedOut)`，不得杀死线程导致后续取词全废（用「忙则跳过」策略）。
 - 事件到达 UI 后必须 `ctx.request_repaint()`。
 
+**事件契约**（`dict_input::Event`）：`Hotkey` / `Selection` / `SelectionFailed` / `HotkeyFailed(String)` / `Tray(TrayAction)` / `SecondLaunch`。
+`HotkeyFailed` 携带完整中文提示；**注册失败时旧热键继续有效**，UI 必须把它显示给用户，不能只写日志。
+`Host::start` 必须在 `eframe::run_native` **之前**调用（内部要设 Per-Monitor-V2 DPI awareness，winit 建窗后就改不动了）。
+
 ## 4. 配置 schema（`%APPDATA%\dict-popup\config.json`）
 
 ```jsonc
