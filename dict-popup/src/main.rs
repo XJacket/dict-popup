@@ -18,6 +18,7 @@ mod config;
 mod dictionaries;
 mod logging;
 mod platform;
+mod request;
 mod theme;
 mod ui;
 
@@ -26,6 +27,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use eframe::egui;
 
 use dict_input::host::{Event, EventSink, Host, HostError, HostOptions};
+use dict_input::Hotkey;
 
 fn main() -> eframe::Result<()> {
     logging::init(config::log_path());
@@ -63,40 +65,48 @@ fn main() -> eframe::Result<()> {
         }
     });
 
-    let (parsed_hotkey, hotkey_notice) = match dict_input::hotkey::parse(&config.hotkey) {
-        Ok(hotkey) => (Ok(hotkey), None),
+    // The config file is the only textual hotkey source: convert it once here.
+    let (hotkey, hotkey_notice) = match dict_input::hotkey::parse(&config.hotkey) {
+        Ok(hotkey) => (hotkey, None),
         Err(err) => {
             // An unreadable hotkey must not leave the user without a working
             // hotkey at all: fall back to the shipped default and say so.
             logging::error(format!("hotkey: {err}"));
-            (
-                dict_input::hotkey::parse(config::DEFAULT_HOTKEY),
-                Some(format!(
-                    "配置里的热键「{}」无效（{err}），本次使用默认的 {}，请在设置里重新捕获",
-                    config.hotkey,
-                    config::DEFAULT_HOTKEY
-                )),
-            )
+            let hotkey = Hotkey::default();
+            let notice = format!(
+                "配置里的热键「{}」无效（{err}），本次使用默认的 {}，请在设置里重新捕获",
+                config.hotkey,
+                hotkey.canonical()
+            );
+            (hotkey, Some(notice))
         }
     };
 
     let tooltip = "dict-popup".to_string();
-    let (host, host_error) =
-        match Host::start(HostOptions { hotkey: parsed_hotkey, tooltip }, sink) {
-            Ok(host) => (Some(host), None),
-            Err(HostError::AlreadyRunning) => {
-                // The first instance received the "show settings" message.
-                logging::info("another instance is already running; exiting");
-                return Ok(());
-            }
-            Err(err) => {
-                logging::error(format!("host: {err}"));
-                (None, Some(err.to_string()))
-            }
-        };
+    let trim_selection = config.behavior.trim_selection;
+    let (host, host_error) = match Host::start(
+        HostOptions {
+            hotkey: Ok(hotkey),
+            tooltip,
+            trim_selection,
+        },
+        sink,
+    ) {
+        Ok(host) => (Some(host), None),
+        Err(HostError::AlreadyRunning) => {
+            // The first instance received the "show settings" message.
+            logging::info("another instance is already running; exiting");
+            return Ok(());
+        }
+        Err(err) => {
+            logging::error(format!("host: {err}"));
+            (None, Some(err.to_string()))
+        }
+    };
 
     let startup = app::Startup {
         config,
+        hotkey,
         config_path,
         config_error,
         host,

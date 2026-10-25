@@ -1,5 +1,5 @@
-//! Diagnostic: run the real capture pipeline (clipboard, then UIA) and print
-//! what happened.
+//! Diagnostic: run the real capture pipeline (Pot, clipboard, `WM_COPY`, UIA)
+//! and print the structured report.
 //!
 //! ```text
 //! cargo run --release --example capture_probe            # foreground window
@@ -10,13 +10,20 @@
 //! `KEYEVENTF_UNICODE`, which isolates "synthetic input never reaches the
 //! desktop" from "the copy shortcut was ignored".
 
+use dict_input::capture::TrimSelection;
+use dict_input::CaptureTarget;
+
 fn main() {
     if let Ok(text) = std::env::var("DICT_PROBE_TYPE") {
-        let accepted = dict_input::debug_type_text(&text);
+        let accepted = dict_input::diagnostics::type_text(&text);
         println!("typed (unicode): accepted {accepted} input events");
     }
 
-    let hwnd = std::env::args().nth(1).and_then(|a| a.parse::<isize>().ok());
-    println!("--- target window ---");
-    println!("{}", dict_input::debug_capture_once(hwnd));
+    let target = std::env::args()
+        .nth(1)
+        .and_then(|argument| argument.parse::<isize>().ok())
+        .map(|hwnd| CaptureTarget::new(Some(hwnd), TrimSelection::Preserve));
+
+    println!("--- capture diagnostics ---");
+    println!("{}", dict_input::diagnostics::run(target));
 }

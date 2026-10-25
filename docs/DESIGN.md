@@ -49,7 +49,8 @@ UI Automation 作为第二条路径。原因：UIA 在 XAML/Electron/自绘程�
 │ dict-input (Win32 线程)  │ ───────────────► │ dict-popup (egui 主线程) │
 │  · 消息循环 / 热键        │ ◄─────────────── │  · 卡片窗口 / 设置窗口    │
 │  · 托盘 / 单实例          │   Command (mpsc) │  · 配置读写              │
-│  · UIA 取词（独立线程）    │                  │  · 词典查询编排          │
+│  · anchor 采样           │                  │  · request 状态机        │
+│  · capture 流水线         │                  │  · 词典查询编排          │
 └─────────────────────────┘                  └──────────┬───────────┘
                                                         │ 调用
                                               ┌─────────▼──────────┐
@@ -60,15 +61,33 @@ UI Automation 作为第二条路径。原因：UIA 在 XAML/Electron/自绘程�
                                               └────────────────────┘
 ```
 
+**dict-input 内部模块**（`capture` 是唯一拥有取词策略的地方）：
+
+| 模块 | 职责 |
+|---|---|
+| `host.rs` / `host_impl.rs` | 消息循环、热键、托盘、单实例；`Host` 在创建线程处构造 |
+| `anchor.rs` | 热键触发瞬间采样光标位置、工作区、显示器缩放 |
+| `capture/mod.rs` | `capture(target) -> Result<CapturedText, CaptureFailure>`，唯一的取词入口 |
+| `capture/pipeline.rs` | 有序策略、超时预算、剪贴板还原；可注入 `CaptureEnv` |
+| `capture/win32.rs` | `CaptureEnv` 的 Win32 适配器（Pot crate、Ctrl+C、WM_COPY、剪贴板） |
+| `capture/uia.rs` | UI Automation 搜索（最后一条策略） |
+| `capture/text.rs` | `CapturedText`：唯一构造函数，trim/去空/限长 |
+| `capture/service.rs` | 取词 worker/coordinator 线程 |
+| `diagnostics.rs` | 结构化诊断报告；通过装饰真实 `CaptureEnv` 观察同一条流水线 |
+
 **线程规则**
 - 主线程：eframe 事件循环，**不得**直接调用 Win32 或阻塞 IO。
-- Host 线程：消息循环、热键、托盘；不碰 UI。
-- Capture 线程：UIA 取词，`COINIT_MULTITHREADED`；带 1.5 s 软超时；超时只丢弃本次并回调 `SelectionFailed(TimedOut)`，不得杀死线程导致后续取词全废（用「忙则跳过」策略）。
+- Host 线程：消息循环、热键、托盘；不碰 UI。热键到达时先采样 `Anchor`，再发起取词。
+- Capture 线程：跑完整策略流水线（Pot crate → Ctrl+C → WM_COPY → UIA），`COINIT_MULTITHREADED`；
+  预算 `CAPTURE_BUDGET`（1.5 s）。超时只丢弃本次并回报 `CaptureFailure::TimedOut`，
+  不得杀死线程；并发请求返回 `CaptureFailure::Busy`（「忙则跳过」）。
 - 事件到达 UI 后必须 `ctx.request_repaint()`。
 
-**事件契约**（`dict_input::Event`）：`Hotkey` / `Selection` / `SelectionFailed` / `HotkeyFailed(String)` / `Tray(TrayAction)` / `SecondLaunch`。
-`HotkeyFailed` 携带完整中文提示；**注册失败时旧热键继续有效**，UI 必须把它显示给用户，不能只写日志。
-`Host::start` 必须在 `eframe::run_native` **之前**调用（内部要设 Per-Monitor-V2 DPI awareness，winit 建窗后就改不动了）。
+**事件契约**（`dict_input::Event`）：`Hotkey { anchor }` / `Selection(CapturedText)` / `SelectionFailed(CaptureFailure)` / `HotkeyFailed(String)` / `Tray(TrayAction)` / `SecondLaunch`。
+- `Hotkey` 携带按键时刻的锚点，UI 不再自己查光标/显示器/DPI。
+- `Selection` / `SelectionFailed` 只用 `capture` 的类型：文本已校验，失败是枚举而非字符串。
+- `HotkeyFailed` 携带完整中文提示；**注册失败时旧热键继续有效**，UI 必须把它显示给用户，不能只写日志。
+- `Host::start` 必须在 `eframe::run_native` **之前**调用（内部要设 Per-Monitor-V2 DPI awareness，winit 建窗后就改不动了）。
 
 ## 4. 配置 schema（`%APPDATA%\dict-popup\config.json`）
 
@@ -133,14 +152,23 @@ UI Automation 作为第二条路径。原因：UIA 在 XAML/Electron/自绘程�
 
 ## 7. 取词与查询流程
 
-1. 热键 → `Event::Hotkey`。
-2. UI 立即显示"查询中"占位卡（可选，但 ≤ 250 ms 内必须有反馈）。
-3. Host 调 UIA：`GetFocusedElement` → `UIA_TextPatternId` → `GetSelection` → `GetText`。
-   - 无 TextPattern 时回退 `GetCurrentPatternAs(UIA_ValuePatternId)`（单选无选区的输入框）。
-4. 取到文字 → `dict_core::normalize::candidates()` → 逐个候选在**方向匹配**的词典里查；命中即停。
-5. 方向匹配：查询文字含汉字 → 只查 `zh-en` / `zh-zh`；纯 ASCII → 只查 `en-zh` / `en-en`；`auto` 方向按指纹结果归组。
-6. 全部未命中 → 卡片显示"未收录：<词>"，并列出试过的候选（最多 3 个）。
-7. 取词失败 → 托盘气泡/卡片提示（`SelectionError` 的中文文案），不弹模态框。
+1. 热键 → host 采样 `Anchor`（光标、工作区、缩放）→ `Event::Hotkey { anchor }`。
+2. UI 开一个 `request`：`Running { deadline }`，不显示"查询中"占位，等结果或超时。
+3. Host 调 `capture::capture(target)`，内部按固定顺序尝试：
+   1. **Pot crate**（`selection`，与 Pot 同一实现，含修饰键复位与图片还原）
+   2. **Ctrl+C 剪贴板**（先显式松开 9 个修饰键，再发干净的 Ctrl+C，轮询剪贴板序号）
+   3. **WM_COPY**（直接让前台焦点控件自己复制，不依赖合成输入）
+   4. **UI Automation**（`GetFocusedElement` → `TextPattern` → `GetSelection`；无 TextPattern 时回退 `ValuePattern`）
+   顺序固定在本模块内，调用方无法调整；每次尝试都有独立预算，总预算 1.5 s。
+4. 取到文本 → `CapturedText::new(raw, trim)`：按 `trim_selection` 处理、拒绝空白、按字符边界限长。
+   失败的语义在 `CaptureFailure` 里（`NoSelection` / `NoTextPattern` / `InputBlocked` / `ClipboardBusy` / `TimedOut` / `Busy` / `Platform`），
+   文案只在它的 `Display` 里生成一次。
+5. 剪贴板还原：取词前快照一次，取词结束后**恰好写回一次**（成功或失败）。
+6. `CapturedText` → `dict_core::normalize::candidates()` → 逐个候选在**方向匹配**的词典里查；命中即停。
+7. 方向匹配：查询文字含汉字 → 只查 `zh-en` / `zh-zh`；纯 ASCII → 只查 `en-zh` / `en-en`；`auto` 方向按指纹结果归组。
+8. 全部未命中 → 卡片显示"未收录：<词>"，并列出试过的候选（最多 3 个）。
+9. 取词失败 → 卡片提示（`CaptureFailure` 的中文文案），不弹模态框。
+   关闭卡片（Esc / 失焦 / 再按热键）会 `dismiss()` 请求：迟到的结果按状态机丢弃，**不会重新弹卡**。
 
 ## 8. 发行清单
 
@@ -165,9 +193,13 @@ UI Automation 作为第二条路径。原因：UIA 在 XAML/Electron/自绘程�
 
 ## 10. 测试策略
 
-- `dict-core`：已有 14 个单元测试（解析、回退链、方向指纹）。
-- `dict-input`：热键解析/格式化单元测试（已有 7 个）；`host_impl` 的纯逻辑抽成函数测试；UIA 取词只能手工验证（记录在 QA 清单）。
-- `dict-popup`：配置读写、词典注册表、方向筛选、候选排序为纯函数，必须有单元测试。
+- `dict-core`：16 个单元测试（解析、回退链、方向指纹）。
+- `dict-input`：59 个。热键模型与 `HotkeyError` 文案、`CapturedText` 不变量、`CaptureFailure` 文案、
+  capture pipeline（注入 `CaptureEnv` 假实现：策略顺序、还原恰好一次、未变化不算复制、超时、冻结时钟不死循环）、
+  diagnostics 报告渲染、托盘/消息/autostart 纯逻辑。
+- `dict-popup`：56 个。配置读写、词典注册表、方向筛选、候选排序、request 状态机
+  （idle→running→done、dismiss 丢弃迟到结果、busy 与 timed-out 不同、看门狗由预算派生）、锚点定位。
+- 与真实程序交互的取词（剪贴板/UIA 在 Chrome、记事本、Office 里的行为）只能手工验证，记录在 QA 清单。
 - 手工 QA 清单（`docs/QA.md`）：Chrome/记事本/Office/PDF 取词；双屏不同缩放；热键冲突；无选中文字；词典文件被移动；Explorer 重启后托盘图标恢复。
 
 ## 11. 目录归属（并行开发边界）

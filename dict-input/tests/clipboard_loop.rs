@@ -113,7 +113,7 @@ fn create_window(word: &str) -> TestWindow {
 fn clipboard_capture_reads_a_real_selection() {
     // Seed the clipboard BEFORE creating the window: writing to it can wake a
     // clipboard tool that steals the foreground.
-    dict_input::debug_clipboard_write("SENTINEL");
+    dict_input::diagnostics::write_clipboard("SENTINEL");
     let window = create_window("apple");
 
     let done = Arc::new(AtomicBool::new(false));
@@ -122,8 +122,8 @@ fn clipboard_capture_reads_a_real_selection() {
         // Let the window come up and take the foreground first.
         std::thread::sleep(std::time::Duration::from_millis(400));
         // Make sure stale clipboard text cannot masquerade as the selection.
-        dict_input::debug_clipboard_write("SENTINEL");
-        let result = dict_input::debug_capture_selection();
+        dict_input::diagnostics::write_clipboard("SENTINEL");
+        let result = dict_input::diagnostics::capture_selection();
         capture_done.store(true, Ordering::Release);
         result
     });
@@ -163,7 +163,7 @@ fn clipboard_capture_reads_a_real_selection() {
 fn clipboard_capture_survives_the_hotkey_press() {
     // Seed the clipboard BEFORE creating the window: writing to it can wake a
     // clipboard tool that steals the foreground.
-    dict_input::debug_clipboard_write("SENTINEL");
+    dict_input::diagnostics::write_clipboard("SENTINEL");
     let window = create_window("apple");
 
     let done = Arc::new(AtomicBool::new(false));
@@ -171,11 +171,11 @@ fn clipboard_capture_survives_the_hotkey_press() {
     let worker = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(400));
         // Make sure stale clipboard text cannot masquerade as the selection.
-        dict_input::debug_clipboard_write("SENTINEL");
+        dict_input::diagnostics::write_clipboard("SENTINEL");
         // VK_CONTROL, VK_MENU, 'D'
-        dict_input::debug_press_combo(&[0x11, 0x12, 0x44]);
+        dict_input::diagnostics::press_combo(&[0x11, 0x12, 0x44]);
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let result = dict_input::debug_capture_selection();
+        let result = dict_input::diagnostics::capture_selection();
         capture_done.store(true, Ordering::Release);
         result
     });

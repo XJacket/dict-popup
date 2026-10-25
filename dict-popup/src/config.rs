@@ -56,7 +56,8 @@ pub fn log_path() -> PathBuf {
 #[serde(default)]
 pub struct Config {
     pub version: u32,
-    /// Canonical string, see `dict_input::hotkey`.
+    /// Textual form for persistence only; the live model is `Shared::hotkey`
+    /// (see `dict_input::hotkey`).
     pub hotkey: String,
     pub dictionaries: Vec<DictionaryConfig>,
     pub ui: UiConfig,

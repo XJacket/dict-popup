@@ -16,6 +16,7 @@ fn options(tooltip: &str) -> HostOptions {
     HostOptions {
         hotkey: hotkey::parse("Ctrl+Alt+F13"),
         tooltip: tooltip.to_string(),
+        trim_selection: true,
     }
 }
 

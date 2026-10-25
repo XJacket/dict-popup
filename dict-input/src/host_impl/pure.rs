@@ -163,20 +163,6 @@ pub(crate) fn run_value(exe: &Path) -> String {
     format!("\"{}\"", exe.display())
 }
 
-/// Whether a stored `Run` value points at `exe`.
-///
-/// Windows paths are case-insensitive, so the comparison is ASCII-case
-/// insensitive. A moved/renamed exe therefore reports "not enabled", which is
-/// what the settings checkbox should show.
-pub(crate) fn run_value_matches(stored: &str, exe: &Path) -> bool {
-    let stored = stored.trim();
-    let unquoted = stored
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or(stored);
-    unquoted.eq_ignore_ascii_case(&exe.to_string_lossy())
-}
-
 // ---------------------------------------------------------------------------
 // Hotkey bookkeeping / messages
 // ---------------------------------------------------------------------------
@@ -322,33 +308,6 @@ mod tests {
             r#""C:\Program Files\dict-popup\dict-popup.exe""#
         );
         assert_eq!(run_value(Path::new(r"C:\x\app.exe")), r#""C:\x\app.exe""#);
-    }
-
-    #[test]
-    fn autostart_value_matches_case_insensitively() {
-        let exe = Path::new(r"C:\Apps\DictPopup\dict-popup.exe");
-        assert!(run_value_matches(&run_value(exe), exe));
-        assert!(run_value_matches(&run_value(exe).to_uppercase(), exe));
-        assert!(run_value_matches(
-            r#"  "C:\Apps\DictPopup\dict-popup.exe"  "#,
-            exe
-        ));
-        // Unquoted legacy values still match.
-        assert!(run_value_matches(r"C:\Apps\DictPopup\dict-popup.exe", exe));
-    }
-
-    #[test]
-    fn autostart_value_rejects_a_stale_path() {
-        let exe = Path::new(r"C:\Apps\DictPopup\dict-popup.exe");
-        assert!(!run_value_matches(
-            r#""D:\Old\dict-popup.exe""#,
-            exe
-        ));
-        assert!(!run_value_matches("", exe));
-        assert!(!run_value_matches(
-            r#""C:\Apps\DictPopup\dict-popup.exe" --autostart"#,
-            exe
-        ));
     }
 
     #[test]

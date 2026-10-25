@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, ViewportCommand};
 
+use dict_input::hotkey::{Hotkey, HotkeyError, Modifiers, VirtualKey};
+
 use crate::app::{NoticeLevel, Shared};
-use crate::config::{Config, DictionaryConfig, DirectionSpec, ThemeMode, DEFAULT_HOTKEY};
+use crate::config::{Config, DictionaryConfig, DirectionSpec, ThemeMode};
 use crate::dictionaries::{read_bookname, LoadedDictionary, Status};
 use crate::platform;
 
@@ -24,6 +26,12 @@ pub struct SettingsState {
     pub open: bool,
     /// Edited copy; copied back into `Shared::config` by `commit_config`.
     pub draft: Config,
+    /// The hotkey model behind `draft.hotkey`.
+    ///
+    /// The config file stays textual, but the capture UI edits this model
+    /// directly so the value that reaches the host never round-trips through a
+    /// string. It is synced with `Shared::hotkey` on open and on commit.
+    pub draft_hotkey: Hotkey,
     pub dirty_since: Option<Instant>,
     pub saved_at: Option<Instant>,
     pub capture: HotkeyCapture,
@@ -39,6 +47,7 @@ impl Default for SettingsState {
         Self {
             open: false,
             draft: Config::default(),
+            draft_hotkey: Hotkey::default(),
             dirty_since: None,
             saved_at: None,
             capture: HotkeyCapture::default(),
@@ -114,7 +123,7 @@ fn header(ui: &mut egui::Ui, shared: &Shared) {
         });
     });
 
-    let hotkey = shared.settings.draft.hotkey.clone();
+    let hotkey = shared.settings.draft_hotkey.canonical();
     ui.label(
         RichText::new(format!("按 {hotkey} 读取选中文字，在鼠标旁弹出卡片。"))
             .small()
@@ -191,7 +200,7 @@ fn hotkey_section(ui: &mut egui::Ui, shared: &mut Shared) {
 
         ui.horizontal(|ui| {
             ui.label("当前：");
-            ui.monospace(RichText::new(&shared.settings.draft.hotkey).strong());
+            ui.monospace(RichText::new(shared.settings.draft_hotkey.canonical()).strong());
 
             if capturing {
                 ui.label(RichText::new("请按下新的组合键…（Esc 取消）").color(accent));
@@ -206,9 +215,7 @@ fn hotkey_section(ui: &mut egui::Ui, shared: &mut Shared) {
                     };
                 }
                 if ui.button("恢复默认").clicked() {
-                    shared.settings.draft.hotkey = DEFAULT_HOTKEY.to_string();
-                    shared.settings.capture = HotkeyCapture::default();
-                    shared.mark_settings_dirty();
+                    reset_hotkey_to_default(shared);
                 }
             }
         });
@@ -244,114 +251,81 @@ fn hotkey_section(ui: &mut egui::Ui, shared: &mut Shared) {
     });
 }
 
+fn reset_hotkey_to_default(shared: &mut Shared) {
+    shared.settings.draft_hotkey = Hotkey::default();
+    shared.settings.draft.hotkey = shared.settings.draft_hotkey.canonical();
+    shared.settings.capture = HotkeyCapture::default();
+    shared.mark_settings_dirty();
+}
+
 fn apply_capture(shared: &mut Shared, modifiers: egui::Modifiers, key: egui::Key) {
-    if key == egui::Key::Escape && !has_modifier(modifiers) {
+    // Bare Esc cancels the capture; Esc with a modifier is a real hotkey.
+    if key == egui::Key::Escape && modifiers_from_egui(modifiers).is_empty() {
         shared.settings.capture = HotkeyCapture::default();
         return;
     }
 
-    match combo_from(modifiers, key) {
-        Ok(combo) => match dict_input::hotkey::parse(&combo) {
-            Ok(hotkey) => {
-                shared.settings.draft.hotkey = hotkey.to_string();
-                shared.settings.capture = HotkeyCapture::default();
-                shared.mark_settings_dirty();
-            }
-            Err(err) => {
-                shared.settings.capture.error = Some(err.to_string());
-            }
-        },
-        Err(reason) => {
-            shared.settings.capture.error = Some(reason);
+    match hotkey_from_egui(modifiers, key) {
+        Ok(hotkey) => {
+            shared.settings.draft_hotkey = hotkey;
+            shared.settings.draft.hotkey = hotkey.canonical();
+            shared.settings.capture = HotkeyCapture::default();
+            shared.mark_settings_dirty();
+        }
+        Err(err) => {
+            shared.settings.capture.error = Some(err.to_string());
         }
     }
 }
 
-fn has_modifier(modifiers: egui::Modifiers) -> bool {
-    modifiers.ctrl || modifiers.alt || modifiers.shift || modifiers.command || modifiers.mac_cmd
+/// UI adapter: egui owns its key enum, `dict-input` owns the hotkey model.
+///
+/// This translates the event into [`Modifiers`]/[`VirtualKey`] and lets
+/// [`Hotkey::new`] validate it, so the capture path never builds a string that
+/// another module has to parse again.
+fn hotkey_from_egui(modifiers: egui::Modifiers, key: egui::Key) -> Result<Hotkey, HotkeyError> {
+    let key = virtual_key(key).ok_or(HotkeyError::UnsupportedKey)?;
+    Hotkey::new(modifiers_from_egui(modifiers), key)
 }
 
-/// Turn an egui key event into a canonical hotkey string that
-/// `dict_input::hotkey::parse` accepts.
-fn combo_from(modifiers: egui::Modifiers, key: egui::Key) -> Result<String, String> {
-    let token = key_token(key).ok_or_else(|| "不支持这个按键，请换一个".to_string())?;
-    if !has_modifier(modifiers) {
-        return Err("全局热键至少需要 Ctrl / Alt / Shift 之一".to_string());
+fn modifiers_from_egui(modifiers: egui::Modifiers) -> Modifiers {
+    Modifiers {
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        shift: modifiers.shift,
+        // egui only reports the Windows/Super key through `command` when it is
+        // not already used as the platform command modifier.
+        win: modifiers.command && !modifiers.ctrl,
     }
-
-    let mut parts: Vec<String> = Vec::new();
-    if modifiers.ctrl {
-        parts.push("Ctrl".to_string());
-    }
-    if modifiers.alt {
-        parts.push("Alt".to_string());
-    }
-    if modifiers.shift {
-        parts.push("Shift".to_string());
-    }
-    // egui only reports the Windows/Super key through `command` when it is not
-    // already used as the platform command modifier.
-    if modifiers.command && !modifiers.ctrl {
-        parts.push("Win".to_string());
-    }
-    parts.push(token);
-    Ok(parts.join("+"))
 }
 
-fn key_token(key: egui::Key) -> Option<String> {
+/// Translate an egui key into the matching virtual key.
+///
+/// Letters, digits and function keys use egui's own names (`"D"`, `"5"`,
+/// `"F9"`); punctuation is spelled as the canonical hotkey token here. The
+/// actual name-to-virtual-key table stays in `dict-input::hotkey`, so it is
+/// defined exactly once.
+fn virtual_key(key: egui::Key) -> Option<VirtualKey> {
     use egui::Key;
 
-    let token = match key {
-        Key::ArrowUp => "Up".to_string(),
-        Key::ArrowDown => "Down".to_string(),
-        Key::ArrowLeft => "Left".to_string(),
-        Key::ArrowRight => "Right".to_string(),
-        Key::Escape => "Esc".to_string(),
-        Key::Enter => "Enter".to_string(),
-        Key::Tab => "Tab".to_string(),
-        Key::Space => "Space".to_string(),
-        Key::Backspace => "Backspace".to_string(),
-        Key::Delete => "Delete".to_string(),
-        Key::Insert => "Insert".to_string(),
-        Key::Home => "Home".to_string(),
-        Key::End => "End".to_string(),
-        Key::PageUp => "PageUp".to_string(),
-        Key::PageDown => "PageDown".to_string(),
-        Key::Minus => "-".to_string(),
-        Key::Equals => "=".to_string(),
-        Key::OpenBracket => "[".to_string(),
-        Key::CloseBracket => "]".to_string(),
-        Key::Backslash => "\\".to_string(),
-        Key::Semicolon => ";".to_string(),
-        Key::Quote => "'".to_string(),
-        Key::Comma => ",".to_string(),
-        Key::Period => ".".to_string(),
-        Key::Slash => "/".to_string(),
-        Key::Backtick => "`".to_string(),
-        _ => {
-            // Letters (A-Z), digits (Num0-Num9) and F1-F24 print as their own
-            // names; everything else (media keys, browser keys, …) cannot be
-            // registered by dict-input.
-            let name = format!("{key:?}");
-            if name.len() == 1 && name.as_bytes()[0].is_ascii_uppercase() {
-                name
-            } else if let Some(digit) = name.strip_prefix("Num") {
-                match digit.parse::<u32>() {
-                    Ok(number) if (0..=9).contains(&number) => number.to_string(),
-                    _ => return None,
-                }
-            } else if let Some(digits) = name.strip_prefix('F') {
-                match digits.parse::<u32>() {
-                    Ok(number) if (1..=24).contains(&number) => name,
-                    _ => return None,
-                }
-            } else {
-                return None;
-            }
-        }
+    let name = match key {
+        Key::Minus => "-",
+        Key::Equals => "=",
+        Key::OpenBracket => "[",
+        Key::CloseBracket => "]",
+        Key::Backslash => "\\",
+        Key::Semicolon => ";",
+        Key::Quote => "'",
+        Key::Comma => ",",
+        Key::Period => ".",
+        Key::Slash => "/",
+        Key::Backtick => "`",
+        // Escape, Enter, Space, Tab, arrows, navigation keys, letters, digits
+        // and F1-F24 already have a canonical name in dict-input.
+        other => other.name(),
     };
 
-    Some(token)
+    VirtualKey::from_name(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -864,38 +838,63 @@ mod tests {
     }
 
     #[test]
-    fn builds_a_canonical_combo() {
-        let combo = combo_from(mods(true, true, false), egui::Key::D).expect("combo");
-        assert_eq!(combo, "Ctrl+Alt+D");
-        // and dict-input accepts it
-        let parsed = hotkey::parse(&combo).expect("parse");
-        assert_eq!(parsed.to_string(), "Ctrl+Alt+D");
+    fn builds_a_canonical_hotkey() {
+        let model = hotkey_from_egui(mods(true, true, false), egui::Key::D).expect("hotkey");
+        assert_eq!(model.canonical(), "Ctrl+Alt+D");
+        assert_eq!(
+            model,
+            Hotkey::new(
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::NONE
+                },
+                VirtualKey(0x44)
+            )
+            .expect("same model")
+        );
+        // The model default and the shipped config string must not drift.
+        assert_eq!(
+            hotkey::parse(crate::config::DEFAULT_HOTKEY).expect("default parses"),
+            Hotkey::default()
+        );
     }
 
     #[test]
     fn rejects_a_bare_key() {
-        let err = combo_from(mods(false, false, false), egui::Key::D).unwrap_err();
-        assert!(err.contains("至少需要"));
+        let err = hotkey_from_egui(mods(false, false, false), egui::Key::D).unwrap_err();
+        assert_eq!(err, HotkeyError::NoModifier);
+        assert!(err.to_string().contains("至少需要"));
     }
 
     #[test]
     fn rejects_keys_dict_input_cannot_register() {
-        // egui reports it, but dict-input has no token for it (and "+" is the
-        // separator of the hotkey syntax anyway).
-        assert!(combo_from(mods(true, false, false), egui::Key::Plus).is_err());
-        assert!(combo_from(mods(true, false, false), egui::Key::MediaPlayPause).is_err());
+        // egui reports them, but dict-input has no virtual-key mapping.
+        for key in [
+            egui::Key::Plus,
+            egui::Key::MediaPlayPause,
+            egui::Key::F25,
+        ] {
+            assert!(
+                matches!(
+                    hotkey_from_egui(mods(true, false, false), key),
+                    Err(HotkeyError::UnsupportedKey)
+                ),
+                "{key:?} must be rejected"
+            );
+        }
     }
 
     #[test]
-    fn maps_the_keys_the_design_lists() {
-        assert_eq!(key_token(egui::Key::F9).as_deref(), Some("F9"));
-        assert_eq!(key_token(egui::Key::Num5).as_deref(), Some("5"));
-        assert_eq!(key_token(egui::Key::ArrowUp).as_deref(), Some("Up"));
-        assert_eq!(key_token(egui::Key::Escape).as_deref(), Some("Esc"));
-        assert_eq!(key_token(egui::Key::Backtick).as_deref(), Some("`"));
-        assert_eq!(key_token(egui::Key::Slash).as_deref(), Some("/"));
+    fn maps_egui_keys_to_virtual_keys() {
+        assert_eq!(virtual_key(egui::Key::F9), Some(VirtualKey(0x78)));
+        assert_eq!(virtual_key(egui::Key::Num5), Some(VirtualKey(0x35)));
+        assert_eq!(virtual_key(egui::Key::ArrowUp), Some(VirtualKey(0x26)));
+        assert_eq!(virtual_key(egui::Key::Escape), Some(VirtualKey(0x1B)));
+        assert_eq!(virtual_key(egui::Key::Backtick), Some(VirtualKey(0xC0)));
+        assert_eq!(virtual_key(egui::Key::Slash), Some(VirtualKey(0xBF)));
 
-        // Everything we map must be parseable by dict-input.
+        // Everything we map must build a model that parses back to itself.
         for key in [
             egui::Key::A,
             egui::Key::Z,
@@ -907,11 +906,11 @@ mod tests {
             egui::Key::Delete,
             egui::Key::Backslash,
         ] {
-            let token = key_token(key).expect("token");
-            let combo = format!("Ctrl+{token}");
-            assert!(
-                hotkey::parse(&combo).is_ok(),
-                "dict-input rejects {combo}"
+            let model = hotkey_from_egui(mods(true, false, false), key).expect("hotkey");
+            assert_eq!(
+                hotkey::parse(&model.canonical()).expect("canonical parses"),
+                model,
+                "{key:?} did not survive the model round trip"
             );
         }
     }

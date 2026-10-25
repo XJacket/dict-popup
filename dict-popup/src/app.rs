@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
 
-use dict_input::host::{Command, Event, Host};
-use dict_input::TrayAction;
+use dict_input::host::{Anchor, Command, Event, Host};
+use dict_input::{CaptureFailure, Hotkey, TrayAction};
 
 use crate::config::Config;
 use crate::dictionaries::Registry;
 use crate::logging;
+use crate::request::{Info, Outcome, Request};
 use crate::theme::{self, FontInstall};
 use crate::ui::card::{self, CardState};
 use crate::ui::settings::{self, SettingsState};
@@ -69,6 +70,11 @@ pub struct Notice {
 pub struct Shared {
     pub ctx: egui::Context,
     pub config: Config,
+    /// The hotkey currently registered with the host.
+    ///
+    /// `config.hotkey` is the textual persistence form; this model is the value
+    /// the UI edits and the host receives, so applying a hotkey never parses.
+    pub hotkey: Hotkey,
     pub config_path: PathBuf,
     pub config_error: Option<String>,
     pub font: FontInstall,
@@ -77,15 +83,13 @@ pub struct Shared {
     pub registry_loading: bool,
     loader: Option<Receiver<Registry>>,
     pub card: CardState,
+    /// The one capture request: anchor, deadline, content and the pending
+    /// query. The card renders its state; there are no separate
+    /// `pending_hotkey` / `ignore_result` / `card.pending` flags any more.
+    pub request: Request,
     pub settings: SettingsState,
     pub host: Option<Host>,
     pub host_error: Option<String>,
-    /// A hotkey fired and the UIA capture is still in flight. The card is shown
-    /// only when the result arrives (see `on_hotkey`), or by the watchdog.
-    pending_hotkey: Option<Instant>,
-    /// The user dismissed the card while a capture was still running; its
-    /// result must not reopen the card (the host cannot cancel a capture).
-    ignore_result: bool,
 }
 
 impl Shared {
@@ -114,6 +118,7 @@ impl Shared {
     pub fn open_settings(&mut self) {
         if !self.settings.open {
             self.settings.draft = self.config.clone();
+            self.settings.draft_hotkey = self.hotkey;
             self.settings.capture = settings::HotkeyCapture::default();
             self.settings.dirty_since = None;
         }
@@ -145,11 +150,9 @@ impl Shared {
 
     pub fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Hotkey => self.on_hotkey(),
-            Event::Selection(selection) => self.on_selection(selection.text),
-            Event::SelectionFailed(err) => {
-                self.on_selection_failed(err.to_string());
-            }
+            Event::Hotkey { anchor } => self.on_hotkey(anchor),
+            Event::Selection(selection) => self.on_selection(selection.text().to_string()),
+            Event::SelectionFailed(failure) => self.on_selection_failed(failure),
             Event::HotkeyFailed(message) => {
                 // The old hotkey (if any) is still active; surface the reason in
                 // the settings window and as a tray balloon.
@@ -175,79 +178,82 @@ impl Shared {
         }
     }
 
-    fn on_hotkey(&mut self) {
+    fn on_hotkey(&mut self, anchor: Anchor) {
         // While the card is up it holds focus, so UIA could only read our own
         // window. Treat a second press as "dismiss" (the footer says the same).
         if self.card.visible {
-            self.card.visible = false;
-            // The host captures on every hotkey and cannot cancel it, so this
-            // press always has a result in flight; drop it so the card does not
-            // immediately reopen.
-            self.pending_hotkey = None;
-            self.ignore_result = true;
             logging::info("hotkey (dismiss)");
-            self.wake();
+            self.close_card();
             return;
         }
 
         // Do NOT show the card yet. A visible card takes focus, and the UIA
         // worker runs ~10-200 ms later: it would then read *our* window instead
-        // of the user's, which is exactly the "当前程序不支持取词" report.
-        // The card is shown when the selection (or the failure) arrives, with a
-        // watchdog in `logic` that shows "查询中" if capture is slow.
-        self.pending_hotkey = Some(Instant::now());
+        // of the user's, which is exactly the "当前程序不支持取词" report. The
+        // card is shown when the selection (or the failure) arrives, or when
+        // the request's one deadline expires.
+        self.request.start(anchor, Instant::now());
         logging::info("hotkey");
         self.wake();
     }
 
-    /// Show the card for this pass: position it, then reveal `phase`.
-    fn show_card(&mut self, phase: impl FnOnce(&mut CardState)) {
-        self.pending_hotkey = None;
-        let ui_config = self.config.ui.clone();
-        self.card.begin_query(&ui_config);
-        phase(&mut self.card);
+    /// Hide the card and end the request.
+    ///
+    /// The pending query and the deadline live inside the request state, so a
+    /// slow registry load can never reopen a card the user dismissed.
+    pub fn close_card(&mut self) {
+        self.card.hide();
+        self.request.dismiss();
+        self.ctx
+            .send_viewport_cmd_to(card_viewport_id(), ViewportCommand::Visible(false));
         self.wake();
     }
 
-    fn on_selection_failed(&mut self, message: String) {
-        logging::warn(format!("selection failed: {message}"));
-        if self.ignore_result {
-            self.ignore_result = false;
-            self.pending_hotkey = None;
-            return;
+    /// Open the card for the request's current state, positioned at its anchor.
+    fn reveal_card(&mut self) {
+        let anchor = self.request.anchor();
+        let ui_config = self.config.ui.clone();
+        self.card.open_at(&ui_config, anchor);
+        self.wake();
+    }
+
+    fn on_selection_failed(&mut self, failure: CaptureFailure) {
+        logging::warn(format!("selection failed: {failure}"));
+        if self.request.fail(failure) {
+            self.reveal_card();
+        } else {
+            logging::info("failure dropped: request is not running");
         }
-        self.show_card(|card| card.show_error(message));
     }
 
     fn on_selection(&mut self, text: String) {
-        if self.ignore_result {
-            self.ignore_result = false;
-            return;
-        }
-        self.pending_hotkey = None;
-        let ui_config = self.config.ui.clone();
-        self.card.begin_query(&ui_config);
-
-        let query = if self.config.behavior.trim_selection {
-            text.trim().to_string()
-        } else {
-            text
-        };
-
-        if query.trim().is_empty() {
-            self.card.show_error("没有选中文字");
-            self.wake();
-            return;
-        }
-
         // Never log the text, only its length (DESIGN §9.2).
-        logging::info(format!("selection chars={}", query.chars().count()));
+        logging::info(format!("selection chars={}", text.chars().count()));
 
-        if self.registry_loading && self.registry.ready_count() == 0 {
-            self.card.pending = Some(query);
-            self.card.show_info("词典加载中，请稍候…");
-            self.wake();
+        // The host cannot cancel a capture, so a result can arrive after the
+        // card was dismissed or timed out. The state machine already decided
+        // that it is not wanted.
+        if !self.request.is_running() {
+            logging::info("selection dropped: request is not running");
             return;
+        }
+
+        // `dict-input` already applied `behavior.trim_selection` and rejected
+        // empty/whitespace-only captures when it created the CapturedText, so
+        // there is nothing left to trim or re-check here.
+        let outcome = self.outcome_for(text);
+        if self.request.complete(outcome) {
+            self.reveal_card();
+        } else {
+            logging::info("selection dropped: request finished");
+        }
+    }
+
+    /// Turn captured text into what the card shows: the report, a "still
+    /// loading" sentence that keeps the query inside the request, or a hint.
+    fn outcome_for(&mut self, query: String) -> Outcome {
+        if self.registry_loading && self.registry.ready_count() == 0 {
+            return Outcome::Info(Info::waiting("词典加载中，请稍候…", query));
         }
 
         if self.registry.ready_count() == 0 {
@@ -256,15 +262,13 @@ impl Shared {
             } else {
                 "没有可用的词典，请检查设置中的词典路径"
             };
-            self.card.show_info(message);
-            self.wake();
-            return;
+            return Outcome::Info(Info::message(message));
         }
 
-        self.run_lookup(&query);
+        self.lookup_outcome(&query)
     }
 
-    fn run_lookup(&mut self, query: &str) {
+    fn lookup_outcome(&mut self, query: &str) -> Outcome {
         let started = Instant::now();
         let report = self.registry.lookup(query);
         logging::info(format!(
@@ -275,8 +279,7 @@ impl Shared {
             report.filtered,
             started.elapsed().as_micros()
         ));
-        self.card.show_report(report);
-        self.wake();
+        Outcome::Report(report)
     }
 
     // ---- dictionaries -----------------------------------------------------
@@ -340,8 +343,14 @@ impl Shared {
                     );
                 }
 
-                if let Some(query) = self.card.pending.take() {
-                    self.run_lookup(&query);
+                // The query captured while the dictionaries were loading is
+                // held by the request. It is gone if the card was dismissed in
+                // the meantime, which is what used to reopen a closed card.
+                if let Some(query) = self.request.take_pending_query() {
+                    let outcome = self.lookup_outcome(&query);
+                    if self.request.resolve(outcome) {
+                        self.reveal_card();
+                    }
                 }
                 self.wake();
             }
@@ -382,8 +391,14 @@ impl Shared {
 
         let theme_changed = new.ui.theme != self.config.ui.theme
             || (new.ui.font_size - self.config.ui.font_size).abs() > f32::EPSILON;
-        let hotkey_changed = new.hotkey != self.config.hotkey;
+        // Compare models, not strings: re-spelling a hotkey is not a change.
+        let hotkey_changed = self.settings.draft_hotkey != self.hotkey;
+        if hotkey_changed {
+            // The config file stays textual, but it follows the model.
+            new.hotkey = self.settings.draft_hotkey.canonical();
+        }
         let autostart_changed = new.behavior.autostart != self.config.behavior.autostart;
+        let trim_changed = new.behavior.trim_selection != self.config.behavior.trim_selection;
         let dictionaries_changed = new.dictionaries != self.config.dictionaries;
 
         self.config = new;
@@ -394,10 +409,18 @@ impl Shared {
             theme::apply(&self.ctx, self.config.ui.theme, self.config.ui.font_size);
         }
         if hotkey_changed {
+            self.hotkey = self.settings.draft_hotkey;
             self.apply_hotkey();
         }
         if autostart_changed {
             self.apply_autostart();
+        }
+        if trim_changed {
+            if let Some(host) = &self.host {
+                host.send(Command::SetTrimSelection(
+                    self.config.behavior.trim_selection,
+                ));
+            }
         }
         if dictionaries_changed {
             self.reload_registry();
@@ -410,25 +433,21 @@ impl Shared {
         }
 
         self.settings.draft = self.config.clone();
+        self.settings.draft_hotkey = self.hotkey;
         self.set_tooltip();
         self.wake();
     }
 
+    /// Register the current hotkey model.
+    ///
+    /// There is no text parsing here: the model was built once at startup
+    /// (`main`) or by the settings capture UI.
     fn apply_hotkey(&mut self) {
-        match dict_input::hotkey::parse(&self.config.hotkey) {
-            Ok(hotkey) => {
-                if let Some(host) = &self.host {
-                    host.send(Command::SetHotkey(Some(hotkey)));
-                }
-                logging::info(format!("hotkey registered: {}", hotkey));
-            }
-            Err(err) => {
-                self.notify(
-                    NoticeLevel::Error,
-                    format!("热键「{}」无效：{err}", self.config.hotkey),
-                );
-            }
+        let hotkey = self.hotkey;
+        if let Some(host) = &self.host {
+            host.send(Command::SetHotkey(Some(hotkey)));
         }
+        logging::info(format!("hotkey registered: {hotkey}"));
     }
 
     fn apply_autostart(&mut self) {
@@ -480,6 +499,9 @@ pub struct App {
 /// already-running input host.
 pub struct Startup {
     pub config: Config,
+    /// The already-parsed hotkey (the shipped default when the config text was
+    /// invalid). `main` is the one place that converts config text to a model.
+    pub hotkey: Hotkey,
     pub config_path: PathBuf,
     pub config_error: Option<String>,
     pub host: Option<Host>,
@@ -501,6 +523,7 @@ impl App {
         let mut shared = Shared {
             ctx,
             config: startup.config,
+            hotkey: startup.hotkey,
             config_path: startup.config_path,
             config_error: startup.config_error.clone(),
             font,
@@ -509,11 +532,10 @@ impl App {
             registry_loading: false,
             loader: None,
             card: CardState::default(),
+            request: Request::default(),
             settings: SettingsState::default(),
             host: startup.host,
             host_error: startup.host_error.clone(),
-            pending_hotkey: None,
-            ignore_result: false,
         };
 
         if let Some(message) = &shared.config_error {
@@ -579,17 +601,21 @@ impl eframe::App for App {
         shared.poll_registry();
         shared.maybe_commit_config(Instant::now());
 
-        // Watchdog: only if the capture is genuinely slow. Opening the card
-        // earlier would steal focus *while UIA is still reading*, which is the
-        // exact failure we removed: a typical capture is tens of milliseconds,
-        // so in practice the card appears with the result and never mid-capture.
-        if let Some(started) = shared.pending_hotkey {
-            if started.elapsed() >= std::time::Duration::from_millis(1200) {
-                shared.pending_hotkey = None;
-                let ui_config = shared.config.ui.clone();
-                shared.card.begin_query(&ui_config);
-                shared.wake();
-            }
+        // The one capture deadline, owned by the request and derived from
+        // `dict-input`'s own budget. If the result event never arrives, the
+        // request becomes `TimedOut` here and the card shows why; a late result
+        // is then dropped by the state machine.
+        let now = Instant::now();
+        if shared.request.expire(now) {
+            shared.reveal_card();
+        } else if let Some(deadline) = shared.request.deadline() {
+            // Re-arm the wake-up from the *current* deadline every pass: a
+            // second hotkey may have replaced it, and an idle tray app would
+            // otherwise sleep forever instead of timing out.
+            shared.ctx.request_repaint_after_for(
+                deadline.saturating_duration_since(now),
+                ViewportId::ROOT,
+            );
         }
 
         // `--demo`: wait for the registry, then show the card as if the hotkey
@@ -599,7 +625,13 @@ impl eframe::App for App {
                 self.demo = Some(word);
             } else {
                 logging::info(format!("demo lookup chars={}", word.chars().count()));
-                shared.run_lookup(&word);
+                // `--demo` has no hotkey, so there is no anchor from the host;
+                // sample one once through the same code the host uses.
+                shared.request.start(Anchor::sample(), Instant::now());
+                let outcome = shared.lookup_outcome(&word);
+                if shared.request.complete(outcome) {
+                    shared.reveal_card();
+                }
             }
         }
 

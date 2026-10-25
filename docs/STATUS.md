@@ -42,10 +42,10 @@
 1. 备份剪贴板文本；
 2. **等 Ctrl/Alt/Shift/Win 松开**（热键是 Ctrl+Alt+D，不等待的话目标程序看到的是 `Ctrl+Alt+C`）；
 3. 合成 `Ctrl+C`，轮询剪贴板序列号，最长 450 ms；
-4. 读取 `CF_UNICODETEXT`，**立即还原原剪贴板文本**；
-5. 失败时才回退到 UIA。
+4. 读取 `CF_UNICODETEXT`（缺失时回退 `CF_TEXT`），**立即还原原剪贴板文本**；
+5. 注入没到达（剪贴板序号不变）时才回退到 `WM_COPY`，最后才回退到 UIA。
 
-环境变量 `DICT_POPUP_CAPTURE_MODE=uia|clipboard` 可强制单一路径（默认先剪贴板后 UIA）。
+顺序固定在 `capture/pipeline.rs`，不再有环境变量开关（`DICT_POPUP_CAPTURE_MODE` 已删除）。
 剪贴板读写的往返已由 `dict-input/examples/clipboard_probe.rs` 实测通过。
 
 ### 热键按下后卡片不出现（2026-10-24）

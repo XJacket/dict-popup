@@ -7,6 +7,31 @@
 
 ## [Unreleased]
 
+### 变更（架构）
+
+- **取词收成一个 module**（`dict-input/src/capture/`）：Pot crate → Ctrl+C → WM_COPY → UIA 的顺序、超时预算、
+  剪贴板还原都归它所有；删除 `DICT_POPUP_CAPTURE_MODE`、`prefer_clipboard` 与两条重复的轮询循环。
+  新增 `CaptureEnv` seam 与 9 个无需桌面的 pipeline 测试（策略顺序、失败还原一次、未变化不算复制、超时）。
+- **`CapturedText`** 成为唯一可传给查询层的文本表示：构造时 trim、拒绝空白、按字符边界限长，
+  下游不再重复判断（原先同一个判断散在 5 处）。
+- **`CaptureFailure`** 取代 `Automation(String)` 兜底：`NoSelection` / `NoTextPattern` / `InputBlocked` /
+  `ClipboardBusy` / `TimedOut` / `Busy` / `Platform`，中文文案只在 `Display` 里生成。
+- **诊断独立成 module**（`dict-input/src/diagnostics.rs`）：用装饰器包住真实的 `CaptureEnv` 跑同一条流水线，
+  输出结构化 `Report`；删除 `debug_capture_once` 那条约 340 行的并行实现与 7 个 `debug_*` 导出。
+- **热键只有一种表示**：`Hotkey::new(modifiers, key)` 直接构造，`canonical()` 是唯一拼写；
+  设置窗口不再"拼字符串再解析"，键名表与错误文案各只有一份。
+- **一次取词只有一个状态机**（`dict-popup/src/request.rs`）：`Idle / Running{deadline} / Done / Failed / TimedOut`。
+  修复 "Esc 关闭的卡片在词典加载完成后自己弹回"（`card.pending` 重放）。
+- **`Event::Hotkey` 携带 `Anchor`**（光标、工作区、缩放，热键瞬间采样）；UI 不再自己查 Win32，
+  DPI 只有锚点一个来源，卡片定位改为纯函数。
+- 单一超时权威：`capture::CAPTURE_BUDGET`（1.5 s），UI 看门狗由它派生（+300 ms 投递宽限）。
+- 删除 pass-through：`Host::from_parts`、`host::channel`、`HostError::HotkeyUnavailable`、
+  未使用的 autostart 读取路径、`SearchStats`。
+
+### 测试
+
+- `dict-core` 16、`dict-input` 59、`dict-popup` 56（原 16 / 31 / 44）。
+
 ## [0.1.0] - 2026-10-24
 
 首个发布版本：离线划词词典，取代 `legacy/goldendict-uia-hotkey` 的“热键 + GoldenDict”组合。

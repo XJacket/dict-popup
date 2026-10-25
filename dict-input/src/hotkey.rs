@@ -50,10 +50,94 @@ impl Modifiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VirtualKey(pub u32);
 
+impl VirtualKey {
+    /// Look up a key by name (case-insensitive).
+    ///
+    /// This is the one key-name table: the config parser and the settings UI
+    /// adapter both resolve keys through it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let upper = name.to_ascii_uppercase();
+        if let Some((_, code)) = NAMED.iter().find(|(named, _)| *named == upper) {
+            return Some(Self(*code));
+        }
+
+        // Single letter or digit.
+        let mut chars = upper.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_alphabetic() {
+                return Some(Self(0x41 + (c as u32 - 'A' as u32)));
+            }
+            if c.is_ascii_digit() {
+                return Some(Self(0x30 + (c as u32 - '0' as u32)));
+            }
+        }
+
+        // Function keys F1..F24.
+        if let Some(rest) = upper.strip_prefix('F') {
+            if let Ok(n) = rest.parse::<u32>() {
+                if (1..=24).contains(&n) {
+                    return Some(Self(0x70 + n - 1));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Whether this key has a canonical name, i.e. `dict-input` can register
+    /// it. Everything else (media keys, F25.., ...) is rejected by the capture
+    /// UI with [`HotkeyError::UnsupportedKey`].
+    pub fn is_supported(self) -> bool {
+        Self::from_name(&key_name(self)).is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hotkey {
     pub mods: Modifiers,
     pub vk: VirtualKey,
+}
+
+impl Hotkey {
+    /// Build a hotkey directly from its parts, without going through text.
+    ///
+    /// This is the validated constructor used by the settings capture UI: it
+    /// enforces the same policy the UI used to implement itself (one of
+    /// Ctrl/Alt/Shift/Win, and a key `dict-input` can register). [`parse`]
+    /// remains the config-text entry point and stays more permissive: the
+    /// shipped config tests require bare keys such as `F9` to parse.
+    pub fn new(mods: Modifiers, vk: VirtualKey) -> Result<Self, HotkeyError> {
+        if mods.is_empty() {
+            return Err(HotkeyError::NoModifier);
+        }
+        if !vk.is_supported() {
+            return Err(HotkeyError::UnsupportedKey);
+        }
+        Ok(Self { mods, vk })
+    }
+
+    /// Canonical spelling used by the settings UI and the config file.
+    ///
+    /// `Display` and this method share the same implementation, so modifier
+    /// order is defined in exactly one place.
+    pub fn canonical(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl Default for Hotkey {
+    /// `Ctrl+Alt+D`, the shipped default. `config::DEFAULT_HOTKEY` must keep
+    /// rendering to the same text (the popup tests assert it).
+    fn default() -> Self {
+        Self {
+            mods: Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::NONE
+            },
+            vk: VirtualKey(b'D' as u32),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +149,10 @@ pub enum HotkeyError {
     UnknownKey(String),
     /// Only modifiers, no key ("Ctrl+Alt").
     MissingKey,
+    /// The capture UI saw no modifier.
+    NoModifier,
+    /// The key has no virtual-key mapping `dict-input` can register.
+    UnsupportedKey,
 }
 
 impl fmt::Display for HotkeyError {
@@ -74,6 +162,8 @@ impl fmt::Display for HotkeyError {
             HotkeyError::MultipleKeys(s) => write!(f, "只能有一个主键，多余的：{s}"),
             HotkeyError::UnknownKey(s) => write!(f, "无法识别的按键：{s}"),
             HotkeyError::MissingKey => write!(f, "缺少主键（例如 D、F5、Space）"),
+            HotkeyError::NoModifier => write!(f, "全局热键至少需要 Ctrl / Alt / Shift 之一"),
+            HotkeyError::UnsupportedKey => write!(f, "不支持这个按键，请换一个"),
         }
     }
 }
@@ -137,7 +227,8 @@ pub fn parse(input: &str) -> Result<Hotkey, HotkeyError> {
             "SHIFT" => mods.shift = true,
             "WIN" | "SUPER" | "META" => mods.win = true,
             _ => {
-                let vk = parse_key(&upper).ok_or_else(|| HotkeyError::UnknownKey(token.to_string()))?;
+                let vk = VirtualKey::from_name(&upper)
+                    .ok_or_else(|| HotkeyError::UnknownKey(token.to_string()))?;
                 if let Some((_, first)) = &key {
                     return Err(HotkeyError::MultipleKeys(format!("{first}, {token}")));
                 }
@@ -148,34 +239,6 @@ pub fn parse(input: &str) -> Result<Hotkey, HotkeyError> {
 
     let (vk, _) = key.ok_or(HotkeyError::MissingKey)?;
     Ok(Hotkey { mods, vk })
-}
-
-fn parse_key(upper: &str) -> Option<VirtualKey> {
-    if let Some((_, code)) = NAMED.iter().find(|(name, _)| *name == upper) {
-        return Some(VirtualKey(*code));
-    }
-
-    // Single letter or digit.
-    let mut chars = upper.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if c.is_ascii_alphabetic() {
-            return Some(VirtualKey(0x41 + (c as u32 - 'A' as u32)));
-        }
-        if c.is_ascii_digit() {
-            return Some(VirtualKey(0x30 + (c as u32 - '0' as u32)));
-        }
-    }
-
-    // Function keys F1..F24.
-    if let Some(rest) = upper.strip_prefix('F') {
-        if let Ok(n) = rest.parse::<u32>() {
-            if (1..=24).contains(&n) {
-                return Some(VirtualKey(0x70 + n - 1));
-            }
-        }
-    }
-
-    None
 }
 
 /// Canonical spelling, modifiers in Ctrl+Alt+Shift+Win order.
@@ -301,6 +364,113 @@ mod tests {
         let hk = parse("Shift+Alt+Ctrl+D").unwrap();
         assert_eq!(hk.to_string(), "Ctrl+Alt+Shift+D");
         assert_eq!(parse("Ctrl+Alt+D").unwrap().to_string(), "Ctrl+Alt+D");
+    }
+
+    fn mods(ctrl: bool, alt: bool, shift: bool, win: bool) -> Modifiers {
+        Modifiers {
+            ctrl,
+            alt,
+            shift,
+            win,
+        }
+    }
+
+    #[test]
+    fn default_is_ctrl_alt_d() {
+        let hk = Hotkey::default();
+        assert_eq!(hk.canonical(), "Ctrl+Alt+D");
+        assert_eq!(parse("Ctrl+Alt+D").unwrap(), hk);
+    }
+
+    #[test]
+    fn new_matches_parse_of_its_canonical_string() {
+        let cases = [
+            (mods(true, true, false, false), VirtualKey(0x44)),
+            (mods(true, false, false, false), VirtualKey(0x78)),
+            (mods(false, true, true, true), VirtualKey(0x20)),
+            (mods(false, false, true, false), VirtualKey(0xC0)),
+            (mods(true, false, false, false), VirtualKey(0x35)),
+        ];
+
+        for (modifiers, key) in cases {
+            let hotkey = Hotkey::new(modifiers, key).expect("constructs a valid hotkey");
+            assert_eq!(hotkey.canonical(), hotkey.to_string());
+            let reparsed = parse(&hotkey.canonical()).expect("canonical text parses");
+            assert_eq!(reparsed, hotkey, "round trip failed for {hotkey}");
+        }
+    }
+
+    #[test]
+    fn new_renders_modifiers_in_canonical_order() {
+        let hotkey = Hotkey::new(mods(true, true, true, true), VirtualKey(0x44))
+            .expect("constructs a valid hotkey");
+        assert_eq!(hotkey.canonical(), "Ctrl+Alt+Shift+Win+D");
+    }
+
+    #[test]
+    fn canonical_order_does_not_depend_on_input_order() {
+        for input in ["Shift+Alt+Ctrl+D", "Alt+Shift+Ctrl+D", "Ctrl+Shift+Alt+D"] {
+            assert_eq!(parse(input).unwrap().canonical(), "Ctrl+Alt+Shift+D");
+        }
+        assert_eq!(
+            parse("Win+Shift+Alt+Ctrl+D").unwrap().canonical(),
+            "Ctrl+Alt+Shift+Win+D"
+        );
+    }
+
+    #[test]
+    fn new_rejects_missing_modifier_and_unsupported_keys() {
+        assert_eq!(
+            Hotkey::new(Modifiers::NONE, VirtualKey(0x44)).unwrap_err(),
+            HotkeyError::NoModifier
+        );
+        assert_eq!(
+            Hotkey::new(mods(true, false, false, false), VirtualKey(0x88)).unwrap_err(),
+            HotkeyError::UnsupportedKey
+        );
+        assert!(Hotkey::new(mods(false, true, false, false), VirtualKey(0x00)).is_err());
+    }
+
+    #[test]
+    fn every_error_has_its_own_sentence() {
+        let cases = [
+            (HotkeyError::Empty, "热键为空"),
+            (
+                HotkeyError::MultipleKeys("D, E".to_string()),
+                "只能有一个主键，多余的：D, E",
+            ),
+            (
+                HotkeyError::UnknownKey("Foo".to_string()),
+                "无法识别的按键：Foo",
+            ),
+            (HotkeyError::MissingKey, "缺少主键（例如 D、F5、Space）"),
+            (
+                HotkeyError::NoModifier,
+                "全局热键至少需要 Ctrl / Alt / Shift 之一",
+            ),
+            (HotkeyError::UnsupportedKey, "不支持这个按键，请换一个"),
+        ];
+
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence);
+        }
+    }
+
+    #[test]
+    fn key_names_resolve_through_one_table() {
+        for (name, code) in [
+            ("D", 0x44),
+            ("f9", 0x78),
+            ("Space", 0x20),
+            ("PageDown", 0x22),
+            ("-", 0xBD),
+            ("`", 0xC0),
+        ] {
+            let key = VirtualKey::from_name(name).expect("known key");
+            assert_eq!(key, VirtualKey(code));
+            assert!(key.is_supported(), "{name} must be supported");
+        }
+        assert!(!VirtualKey(0x88).is_supported());
     }
 
     #[test]

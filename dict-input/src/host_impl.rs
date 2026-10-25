@@ -1,15 +1,18 @@
 //! Win32 implementation of the host layer.
 //!
-//! This module (and its private children) is the only place in the crate that
-//! talks to Win32. The public surface lives in [`crate::host`].
+//! The public surface is re-exported from [`crate::host`]. Win32 code is split
+//! by concern: this module owns the window/hotkey/tray plumbing (and the
+//! [`Host`] handle that drives it), while the capture adapters live in
+//! [`crate::capture`].
 //!
 //! Threading model (docs/DESIGN.md §3):
 //!
 //! * the **host thread** owns a hidden top-level window, the global hotkey, the
 //!   tray icon and the command queue; it runs one `GetMessageW` loop and is the
 //!   only thread that calls the [`EventSink`];
-//! * the **capture threads** ([`uia`]) do UI Automation and post their results
-//!   back to the host thread as private window messages;
+//! * the **capture threads** ([`crate::capture::Capture`]) run the capture
+//!   pipeline and post their results back to the host thread as private window
+//!   messages;
 //! * the **UI thread** only ever calls [`Host::send`](crate::Host::send), which
 //!   sends over an mpsc channel and posts a wake-up message, so it never blocks
 //!   on Win32.
@@ -21,43 +24,11 @@
 //! it cannot, `start` still succeeds and the DPI call becomes a no-op.
 
 mod autostart_impl;
-mod clipboard;
+#[path = "anchor.rs"]
+pub(crate) mod anchor;
 mod pure;
 mod tray_impl;
-mod uia;
 mod win32_util;
-
-/// Diagnostics for the capture path, exposed through `dict_input::debug_capture_report`.
-pub(crate) fn debug_capture_report(hwnd: isize) -> String {
-    uia::debug_capture_report(hwnd)
-}
-
-pub(crate) fn debug_clipboard_read() -> Option<String> {
-    clipboard::read_text()
-}
-
-pub(crate) fn debug_clipboard_write(text: &str) {
-    clipboard::write_text(text);
-}
-
-pub(crate) fn debug_capture_once(target_hwnd: Option<isize>) -> String {
-    uia::debug_capture_once(target_hwnd)
-}
-
-pub(crate) fn debug_type_text(text: &str) -> usize {
-    clipboard::debug_type_text(text)
-}
-
-pub(crate) fn debug_press_combo(keys: &[u16]) {
-    clipboard::debug_press_combo(keys)
-}
-
-/// Run the clipboard capture once and return the text or the error message.
-pub(crate) fn debug_capture_selection() -> Result<String, String> {
-    clipboard::capture()
-        .map(|selection| selection.text)
-        .map_err(|error| error.to_string())
-}
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -89,9 +60,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPED,
 };
 
-use crate::host::{Command, Event, EventSink, Host, HostError, HostOptions};
+use crate::capture::{CaptureFailure, CaptureTarget, TrimSelection};
+use crate::host::{Anchor, Command, Event, EventSink, HostError, HostOptions};
 use crate::hotkey::Hotkey;
-use crate::selection::SelectionError;
 
 /// Handle used by the UI thread to wake the host message loop.
 ///
@@ -125,6 +96,59 @@ impl Waker {
                 LPARAM(0),
             )
         };
+    }
+}
+
+/// Handle to the running host thread.
+///
+/// Defined here, next to the `Waker` it owns, so the private wake handle never
+/// appears in the public `crate::host` module; that module re-exports this type.
+pub struct Host {
+    tx: Sender<Command>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    waker: Waker,
+}
+
+impl Host {
+    /// Start the host. The sink is called from the host thread.
+    ///
+    /// Side effects, in order:
+    ///
+    /// 1. `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` — call `start`
+    ///    **before** creating any window so the UI gets correct coordinates.
+    ///    If a window already exists the call fails and is ignored.
+    /// 2. Single-instance check (`Local\dict-popup-single`). When another
+    ///    instance is running it is asked to show its settings window and
+    ///    [`HostError::AlreadyRunning`] is returned.
+    /// 3. A dedicated thread is spawned and the hidden host window is created;
+    ///    `start` returns once that thread is ready. Initial hotkey/tray
+    ///    problems arrive as events ([`Event::HotkeyFailed`] can be the first
+    ///    event, possibly just before `start` returns).
+    pub fn start(options: HostOptions, sink: EventSink) -> Result<Self, HostError> {
+        start_host(options, sink)
+    }
+
+    /// Queue a command and wake the message loop. Never blocks.
+    pub fn send(&self, command: Command) {
+        if self.tx.send(command).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Ask the host to stop and wait for it.
+    pub fn shutdown(mut self) {
+        let _ = self.tx.send(Command::Shutdown);
+        self.waker.wake();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Command::Shutdown);
+        self.waker.wake();
     }
 }
 
@@ -188,7 +212,10 @@ struct HostState {
     commands: Receiver<Command>,
     notifier: Arc<Notifier>,
     tray: tray_impl::Tray,
-    capture: Option<uia::Capture>,
+    capture: Option<crate::capture::Capture>,
+    /// `behavior.trim_selection` as last reported by the UI. Applied when a
+    /// [`CaptureTarget`] is built, never by the UI on the captured text.
+    trim_selection: bool,
     hotkey_id: Option<i32>,
     hotkey: Option<Hotkey>,
     show_settings_message: u32,
@@ -203,13 +230,13 @@ struct HostState {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub(crate) fn start(options: HostOptions, sink: EventSink) -> Result<Host, HostError> {
+fn start_host(options: HostOptions, sink: EventSink) -> Result<Host, HostError> {
     // Must run before *any* window exists in this process (docs/DESIGN.md §5).
     init_dpi_awareness();
 
     acquire_single_instance()?;
 
-    let (command_tx, command_rx) = crate::host::channel();
+    let (command_tx, command_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Waker, HostError>>();
 
     let thread = std::thread::Builder::new()
@@ -221,7 +248,11 @@ pub(crate) fn start(options: HostOptions, sink: EventSink) -> Result<Host, HostE
     // few milliseconds it takes to create the window. All later Win32 work
     // happens on the host thread.
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(waker)) => Ok(Host::from_parts(command_tx, thread, waker)),
+        Ok(Ok(waker)) => Ok(Host {
+            tx: command_tx,
+            thread: Some(thread),
+            waker,
+        }),
         Ok(Err(error)) => {
             let _ = thread.join();
             Err(error)
@@ -359,6 +390,7 @@ fn host_thread(
         notifier: Arc::clone(&notifier),
         tray: tray_impl::Tray::new(),
         capture: None,
+        trim_selection: options.trim_selection,
         hotkey_id: None,
         hotkey: None,
         show_settings_message,
@@ -430,7 +462,9 @@ unsafe fn init_host(state: *mut HostState, options: HostOptions) -> Vec<Event> {
     }
 
     let notifier = Arc::clone(&(*state).notifier);
-    (*state).capture = Some(uia::Capture::start(move |event| notifier.push(event)));
+    (*state).capture = Some(crate::capture::Capture::start(move |event| {
+        notifier.push(event)
+    }));
 
     events
 }
@@ -490,6 +524,9 @@ unsafe fn drain_commands(state: *mut HostState) {
         match command {
             Command::SetHotkey(hotkey) => command_set_hotkey(state, hotkey),
             Command::SetTooltip(tooltip) => (*state).tray.set_tip(&tooltip),
+            Command::SetTrimSelection(trim_selection) => {
+                (*state).trim_selection = trim_selection;
+            }
             Command::Notify { title, body } => {
                 let _ = (*state).tray.notify(&title, &body);
             }
@@ -734,21 +771,41 @@ unsafe fn on_hotkey(state: *mut HostState, wparam: WPARAM) {
         return;
     }
 
-    ((*state).sink)(Event::Hotkey);
+    // Sample the anchor *now*, before the capture starts: the UI positions the
+    // card from it when the result arrives, up to a whole capture budget later,
+    // when the cursor may already be somewhere else.
+    let anchor = Anchor::sample();
+
+    ((*state).sink)(Event::Hotkey { anchor });
 
     // Remember *which window* the user was working in. UIA's "focused element"
     // is unreliable across toolkits (WinUI/XAML apps often report the top-level
     // window, which exposes no text pattern), so the target window is captured
     // here and searched for a text element by the worker.
-    let target = match (*state).capture_override {
-        Some(hwnd) => HWND(hwnd as *mut core::ffi::c_void),
-        // SAFETY: no arguments; returns the foreground window or null.
-        None => unsafe { GetForegroundWindow() },
+    //
+    // `DICT_POPUP_CAPTURE_HWND` is a test hook used by scripts/e2e-capture.ps1;
+    // it is read once at host start and then travels inside the CaptureTarget,
+    // never as a global read at job time.
+    let window = match (*state).capture_override {
+        Some(hwnd) if hwnd != 0 => Some(hwnd),
+        _ => {
+            // SAFETY: no arguments; returns the foreground window or null.
+            let foreground = unsafe { GetForegroundWindow() };
+            if foreground.is_invalid() {
+                None
+            } else {
+                Some(foreground.0 as isize)
+            }
+        }
     };
+    let trim = TrimSelection::from_enabled((*state).trim_selection);
+    let target = CaptureTarget::new(window, trim);
 
     let request = match &mut (*state).capture {
         Some(capture) => capture.request(target),
-        None => Err(SelectionError::Automation("取词服务未启动".to_string())),
+        None => Err(CaptureFailure::Platform(
+            "capture service not started".to_string(),
+        )),
     };
     if let Err(error) = request {
         ((*state).sink)(Event::SelectionFailed(error));
@@ -787,10 +844,6 @@ unsafe fn on_destroy(state: *mut HostState, hwnd: HWND) {
 // ---------------------------------------------------------------------------
 // Autostart bridge (the public API lives in `crate::autostart`)
 // ---------------------------------------------------------------------------
-
-pub(crate) fn autostart_query() -> std::io::Result<bool> {
-    autostart_impl::query()
-}
 
 pub(crate) fn autostart_set(enabled: bool) -> std::io::Result<()> {
     autostart_impl::set(enabled)

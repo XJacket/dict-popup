@@ -1,16 +1,19 @@
 //! The Win32 host: owns the message-loop thread, the global hotkey, the tray
-//! icon, single-instance detection, and UIA capture.
+//! icon, single-instance detection, and the capture service.
 //!
 //! `Host::start` performs the two one-off process-level Win32 calls (DPI
 //! awareness and the single-instance mutex), then all Win32 work happens on the
 //! dedicated host thread. The UI never blocks on Win32 after `start` returns,
-//! and a hung UIA provider can never freeze the tray icon or the message pump.
+//! and a hung UI Automation provider can never freeze the tray icon or the
+//! message pump.
 
 use std::fmt;
 
+use crate::capture::{CaptureFailure, CapturedText};
 use crate::hotkey::{Hotkey, HotkeyError};
-use crate::selection::{Selection, SelectionError};
 use crate::tray::TrayAction;
+
+pub use crate::host_impl::anchor::{Anchor, WorkArea};
 
 /// Events pushed to the UI thread.
 ///
@@ -19,11 +22,17 @@ use crate::tray::TrayAction;
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The global hotkey fired.
-    Hotkey,
-    /// A selection was captured successfully.
-    Selection(Selection),
+    ///
+    /// `anchor` is sampled on the host thread in the instant the key was
+    /// handled (cursor position, that monitor's work area, and its scale
+    /// factor). The UI places the card from it, so the position does not
+    /// depend on where the mouse or the focus is when the capture result
+    /// arrives up to one [`crate::capture::CAPTURE_BUDGET`] later.
+    Hotkey { anchor: Anchor },
+    /// A validated, non-empty selection was captured successfully.
+    Selection(CapturedText),
     /// Capture failed; the UI decides whether to beep or show a hint.
-    SelectionFailed(SelectionError),
+    SelectionFailed(CaptureFailure),
     /// A hotkey could not be registered (initial registration or
     /// [`Command::SetHotkey`]).
     ///
@@ -52,6 +61,11 @@ pub enum Command {
     SetTooltip(String),
     /// Show a tray balloon when something needs the user's attention.
     Notify { title: String, body: String },
+    /// Apply the UI's `behavior.trim_selection` preference to future captures.
+    ///
+    /// Trimming happens when the text is created (see
+    /// [`crate::CapturedText`]), so the UI never has to trim on its side.
+    SetTrimSelection(bool),
     /// Stop the message loop and remove the tray icon.
     Shutdown,
 }
@@ -60,10 +74,6 @@ pub enum Command {
 pub enum HostError {
     /// Another instance already owns the single-instance mutex.
     AlreadyRunning,
-    /// Kept for API compatibility. The host currently reports hotkey failures
-    /// through [`Event::HotkeyFailed`] instead, so a taken hotkey does not
-    /// prevent the app (and its tray icon) from starting.
-    HotkeyUnavailable(HotkeyError),
     /// Window class / message window creation failed.
     Win32(String),
 }
@@ -72,7 +82,6 @@ impl fmt::Display for HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HostError::AlreadyRunning => write!(f, "已经有一个实例在运行"),
-            HostError::HotkeyUnavailable(e) => write!(f, "热键注册失败：{e}"),
             HostError::Win32(m) => write!(f, "Win32 初始化失败：{m}"),
         }
     }
@@ -86,83 +95,11 @@ pub type EventSink = Box<dyn Fn(Event) + Send + 'static>;
 pub struct HostOptions {
     pub hotkey: Result<Hotkey, HotkeyError>,
     pub tooltip: String,
-}
-
-impl Default for HostOptions {
-    fn default() -> Self {
-        Self {
-            hotkey: crate::hotkey::parse("Ctrl+Alt+D"),
-            tooltip: "dict-popup".to_string(),
-        }
-    }
+    /// Apply `behavior.trim_selection` to captured text (see
+    /// [`Command::SetTrimSelection`] for changes after startup).
+    pub trim_selection: bool,
 }
 
 /// Handle to the running host thread. Dropping it does not stop the thread;
 /// call [`Host::shutdown`] or send [`Command::Shutdown`].
-pub struct Host {
-    tx: std::sync::mpsc::Sender<Command>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    waker: crate::host_impl::Waker,
-}
-
-impl Host {
-    pub(crate) fn from_parts(
-        tx: std::sync::mpsc::Sender<Command>,
-        thread: std::thread::JoinHandle<()>,
-        waker: crate::host_impl::Waker,
-    ) -> Self {
-        Self {
-            tx,
-            thread: Some(thread),
-            waker,
-        }
-    }
-
-    /// Start the host. The sink is called from the host thread.
-    ///
-    /// Side effects, in order:
-    ///
-    /// 1. `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` — call `start`
-    ///    **before** creating any window so the UI gets correct coordinates.
-    ///    If a window already exists the call fails and is ignored.
-    /// 2. Single-instance check (`Local\dict-popup-single`). When another
-    ///    instance is running it is asked to show its settings window and
-    ///    [`HostError::AlreadyRunning`] is returned.
-    /// 3. A dedicated thread is spawned and the hidden host window is created;
-    ///    `start` returns once that thread is ready. Initial hotkey/tray
-    ///    problems arrive as events ([`Event::HotkeyFailed`] can be the first
-    ///    event, possibly just before `start` returns).
-    pub fn start(options: HostOptions, sink: EventSink) -> Result<Self, HostError> {
-        crate::host_impl::start(options, sink)
-    }
-
-    /// Queue a command and wake the message loop. Never blocks.
-    pub fn send(&self, command: Command) {
-        if self.tx.send(command).is_ok() {
-            self.waker.wake();
-        }
-    }
-
-    /// Ask the host to stop and wait for it.
-    pub fn shutdown(mut self) {
-        let _ = self.tx.send(Command::Shutdown);
-        self.waker.wake();
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        let _ = self.tx.send(Command::Shutdown);
-        self.waker.wake();
-    }
-}
-
-pub(crate) fn channel() -> (
-    std::sync::mpsc::Sender<Command>,
-    std::sync::mpsc::Receiver<Command>,
-) {
-    std::sync::mpsc::channel()
-}
+pub use crate::host_impl::Host;

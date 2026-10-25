@@ -219,6 +219,10 @@ impl Registry {
             filtered: 0,
         };
 
+        // Public-API guard, not a capture-path decision: this function is also
+        // called by tests and `--demo` with arbitrary text. The hotkey path
+        // never reaches here empty, because dict-input's CapturedText
+        // guarantees non-empty text.
         if query.trim().is_empty() {
             return report;
         }

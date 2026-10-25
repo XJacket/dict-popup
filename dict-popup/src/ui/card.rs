@@ -1,5 +1,10 @@
 //! The floating card: a frameless, always-on-top, translucent viewport that
 //! shows one query result (DESIGN §5).
+//!
+//! The card has no lifecycle of its own: [`crate::request::Request`] says
+//! whether a request is running, finished, failed or timed out, and the card
+//! renders that state. `CardState` keeps only presentation state (visibility,
+//! fade, measured size) and the anchor it was placed at.
 
 use std::time::{Duration, Instant};
 
@@ -7,10 +12,12 @@ use egui::{
     Color32, CornerRadius, Key, Margin, RichText, Stroke, TextStyle, Vec2, ViewportCommand,
 };
 
+use dict_input::host::Anchor;
+
 use crate::app::Shared;
 use crate::config::UiConfig;
 use crate::dictionaries::{LookupReport, QueryScript, Registry};
-use crate::platform::WorkArea;
+use crate::request::{Outcome, State};
 use crate::theme::{self, CardPalette};
 
 /// Transparent border around the card, so the painted shadow has room and the
@@ -19,47 +26,24 @@ use crate::theme::{self, CardPalette};
 pub const PAD: f32 = 20.0;
 /// Total fade-in time (DESIGN §5: 150 ms).
 pub const FADE_SECONDS: f32 = 0.15;
-/// Offset from the cursor, in egui points (DESIGN §5).
+/// Offset from the anchor cursor, in egui points (DESIGN §5).
 pub const CURSOR_OFFSET: (f32, f32) = (16.0, 20.0);
 /// Ignore focus loss for a moment after opening, while Windows hands focus over.
 const FOCUS_GRACE: Duration = Duration::from_millis(350);
-/// Safety net for a capture whose `SelectionFailed` never arrived (dict-input's
-/// UIA budget is 1.5 s; this is deliberately generous).
-const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_ESTIMATED_HEIGHT: f32 = 220.0;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub enum Phase {
-    /// Nothing has been queried yet.
-    Idle,
-    /// Waiting for the UIA capture ("查询中" placeholder).
-    Querying { since: Instant },
-    /// A finished lookup (may still have zero hits).
-    Ready(LookupReport),
-    /// Informational card (no dictionaries configured, loading, ...).
-    Info(String),
-    /// Capture or lookup error.
-    Failed(String),
-}
-
 pub struct CardState {
     pub visible: bool,
-    pub phase: Phase,
-    /// Bumped whenever the content is replaced; used for widget ids.
-    pub generation: u64,
     /// Bumped only when the card goes from hidden to visible; drives the
     /// 150 ms fade-in and the one-time focus request.
     pub open_generation: u64,
-    /// Cursor position when the card was opened, in physical pixels.
-    pub anchor_phys: Option<(i32, i32)>,
-    /// Work area of the monitor the cursor was on, in physical pixels.
-    pub work_area: Option<WorkArea>,
-    /// Scale factor of that monitor, used before the first frame.
-    pub monitor_scale: f32,
+    /// Anchor of the request this card currently shows: cursor, work area and
+    /// scale, sampled by the host when the hotkey fired.
+    pub anchor: Anchor,
     /// Last size/position we asked the OS for, in egui points.
     pub window_size: Vec2,
     pub window_pos: Option<egui::Pos2>,
@@ -74,20 +58,14 @@ pub struct CardState {
     pub shown_at: Option<Instant>,
     /// Height of the card frame measured on the previous frame.
     pub measured_height: Option<f32>,
-    /// Query captured while the registry was still loading.
-    pub pending: Option<String>,
 }
 
 impl Default for CardState {
     fn default() -> Self {
         Self {
             visible: false,
-            phase: Phase::Idle,
-            generation: 0,
             open_generation: 0,
-            anchor_phys: None,
-            work_area: None,
-            monitor_scale: 1.0,
+            anchor: Anchor::default(),
             window_size: Vec2::new(320.0, DEFAULT_ESTIMATED_HEIGHT),
             window_pos: None,
             needs_position: false,
@@ -95,21 +73,28 @@ impl Default for CardState {
             saw_focus: false,
             shown_at: None,
             measured_height: None,
-            pending: None,
         }
     }
 }
 
 impl CardState {
-    /// Show the "查询中" placeholder at the cursor (called on `Event::Hotkey`,
-    /// well inside the ≤ 250 ms feedback budget of DESIGN §7.2).
-    pub fn begin_query(&mut self, ui: &UiConfig) {
-        self.mark_opened();
-        self.phase = Phase::Querying {
-            since: Instant::now(),
-        };
-        self.generation = self.generation.wrapping_add(1);
-        self.pending = None;
+    /// Reveal the card at `anchor`: estimate its size from the last measured
+    /// frame, position it and start the fade-in.
+    ///
+    /// Called when a request finishes (or when `--demo` opens the card). The
+    /// content itself comes from [`crate::request::Request`]; when the card is
+    /// already visible (the deferred lookup replaced "正在加载…"), only the
+    /// content changes and the window stays where it is.
+    pub fn open_at(&mut self, ui: &UiConfig, anchor: Anchor) {
+        self.anchor = anchor;
+        if self.visible {
+            return;
+        }
+
+        self.open_generation = self.open_generation.wrapping_add(1);
+        self.shown_at = Some(Instant::now());
+        self.saw_focus = false;
+        self.visible = true;
 
         let height = self
             .measured_height
@@ -117,71 +102,18 @@ impl CardState {
             .clamp(96.0, ui.max_card_height);
         self.window_size = Vec2::new(ui.card_width + PAD * 2.0, height + PAD * 2.0);
         self.window_pos = Some(window_origin(place_card(
-            self.anchor_phys,
-            self.work_area,
+            anchor,
             Vec2::new(ui.card_width, height),
-            self.monitor_scale,
         )));
-        self.needs_position = false;
-    }
-
-    /// Bump the open-generation (fade-in + focus) only on a hidden→visible
-    /// transition, and re-anchor at the cursor.
-    fn mark_opened(&mut self) {
-        if !self.visible {
-            self.open_generation = self.open_generation.wrapping_add(1);
-            self.shown_at = Some(Instant::now());
-            self.saw_focus = false;
-            self.capture_anchor();
-        }
-        self.visible = true;
-    }
-
-    /// Remember where the mouse was and which monitor work area the card must
-    /// stay inside of.
-    fn capture_anchor(&mut self) {
-        self.anchor_phys = crate::platform::cursor_pos();
-        if let Some((x, y)) = self.anchor_phys {
-            if let Some((area, scale)) = crate::platform::work_area_at(x, y) {
-                self.work_area = Some(area);
-                self.monitor_scale = scale;
-            }
-        }
-    }
-
-    pub fn show_report(&mut self, report: LookupReport) {
-        self.reveal(Phase::Ready(report));
-    }
-
-    pub fn show_info(&mut self, text: impl Into<String>) {
-        self.reveal(Phase::Info(text.into()));
-    }
-
-    pub fn show_error(&mut self, text: impl Into<String>) {
-        self.reveal(Phase::Failed(text.into()));
-    }
-
-    fn reveal(&mut self, phase: Phase) {
-        self.mark_opened();
-        self.phase = phase;
-        self.generation = self.generation.wrapping_add(1);
+        // Re-position with the real measured height on the next pass.
         self.needs_position = true;
     }
 
-    /// The text the header shows (headword of the first hit, or the query).
-    pub fn headline(&self) -> String {
-        match &self.phase {
-            Phase::Querying { .. } => "查询中".to_string(),
-            Phase::Ready(report) => report
-                .groups
-                .first()
-                .map(|group| group.entry.headword.clone())
-                .filter(|headword| !headword.is_empty())
-                .unwrap_or_else(|| report.query.clone()),
-            Phase::Info(_) => "dict-popup".to_string(),
-            Phase::Failed(_) => "取词失败".to_string(),
-            Phase::Idle => String::new(),
-        }
+    /// Hide the card (Esc, focus loss, auto-hide, second hotkey).
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.shown_at = None;
+        self.saw_focus = false;
     }
 }
 
@@ -190,24 +122,20 @@ impl CardState {
 // ---------------------------------------------------------------------------
 
 /// Position of the **card frame** (not the window, which is `PAD` larger on
-/// every side): cursor + (16, 20), flipped to the other side when the card would
-/// leave the monitor's work area, then clamped so it is always fully on screen.
-pub fn place_card(
-    cursor_phys: Option<(i32, i32)>,
-    work_area: Option<WorkArea>,
-    card_size: Vec2,
-    scale: f32,
-) -> egui::Pos2 {
-    let scale = if scale.is_finite() && scale > 0.1 {
-        scale
-    } else {
-        1.0
-    };
+/// every side): anchor cursor + (16, 20), flipped to the other side when the
+/// card would leave the monitor's work area, then clamped so it is always fully
+/// on screen.
+///
+/// The scale comes from the anchor - the monitor the hotkey was pressed on -
+/// and from nowhere else. There is deliberately no `pixels_per_point()` input:
+/// on a mixed-DPI setup the two could disagree.
+pub fn place_card(anchor: Anchor, card_size: Vec2) -> egui::Pos2 {
+    let scale = anchor.effective_scale();
 
-    let Some((cx, cy)) = cursor_phys else {
+    let Some((cx, cy)) = anchor.cursor else {
         return egui::pos2(PAD + 64.0, PAD + 64.0);
     };
-    let Some(work) = work_area else {
+    let Some(work) = anchor.work_area else {
         return egui::pos2(
             cx as f32 / scale + CURSOR_OFFSET.0,
             cy as f32 / scale + CURSOR_OFFSET.1,
@@ -231,8 +159,14 @@ pub fn place_card(
         pos.y = cursor.y - CURSOR_OFFSET.1 - card_size.y;
     }
 
-    pos.x = pos.x.clamp(min.x + margin.x, (max.x - card_size.x - margin.x).max(min.x + margin.x));
-    pos.y = pos.y.clamp(min.y + margin.y, (max.y - card_size.y - margin.y).max(min.y + margin.y));
+    pos.x = pos.x.clamp(
+        min.x + margin.x,
+        (max.x - card_size.x - margin.x).max(min.x + margin.x),
+    );
+    pos.y = pos.y.clamp(
+        min.y + margin.y,
+        (max.y - card_size.y - margin.y).max(min.y + margin.y),
+    );
     pos
 }
 
@@ -282,21 +216,6 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
         }
     }
 
-    // ---- query watchdog ---------------------------------------------------
-    // The UIA capture is dropped rather than queued after 1.5 s (dict-input
-    // contract); this is the belt-and-braces version, so a lost event can never
-    // leave the spinner animating for ever.
-    if let Phase::Querying { since } = shared.card.phase {
-        let waited = now.saturating_duration_since(since);
-        if waited > QUERY_TIMEOUT {
-            shared
-                .card
-                .show_error("取词超时，请重试。若一直失败，当前程序可能不支持 UIA 取词。");
-        } else {
-            ui.ctx().request_repaint_after(QUERY_TIMEOUT - waited);
-        }
-    }
-
     // ---- fade-in ----------------------------------------------------------
     // Driven by wall-clock time, not egui's animation manager: opening the card
     // owns the fade, so it always ends after exactly FADE_SECONDS (a handful of
@@ -320,6 +239,7 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
     // Room for the header, two separators, the footer and the frame margins,
     // so that a fully expanded body still fits inside `max_card_height`.
     let body_cap = (ui_config.max_card_height - PAD * 2.0 - 130.0).max(120.0);
+    let revision = shared.request.revision();
 
     let (card_height, close_clicked) = egui::Frame::NONE
         .inner_margin(Margin::same(PAD as i8))
@@ -338,8 +258,9 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
                     ui,
                     &palette,
                     &ui_config,
-                    &mut shared.card,
+                    shared.request.state(),
                     &shared.registry,
+                    revision,
                     body_cap,
                 )
             });
@@ -361,13 +282,7 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
     }
 
     if shared.card.needs_position {
-        let ppp = ui.ctx().pixels_per_point();
-        let card_pos = place_card(
-            shared.card.anchor_phys,
-            shared.card.work_area,
-            desired - Vec2::splat(PAD * 2.0),
-            ppp,
-        );
+        let card_pos = place_card(shared.card.anchor, desired - Vec2::splat(PAD * 2.0));
         let pos = window_origin(card_pos);
         shared.card.window_pos = Some(pos);
         ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(pos));
@@ -375,9 +290,9 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
     }
 
     if close || close_clicked {
-        shared.card.visible = false;
-        shared.card.shown_at = None;
-        ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+        // Closing the card ends the request: the pending query and any late
+        // capture result die here, so the card cannot reopen by itself.
+        shared.close_card();
     }
 }
 
@@ -385,20 +300,21 @@ fn card_contents(
     ui: &mut egui::Ui,
     palette: &CardPalette,
     ui_config: &UiConfig,
-    card: &mut CardState,
+    state: &State,
     registry: &Registry,
+    revision: u64,
     body_cap: f32,
 ) -> bool {
-    card_header(ui, palette, card);
+    card_header(ui, palette, state);
     ui.add_space(2.0);
     separator(ui, palette);
 
     egui::ScrollArea::vertical()
-        .id_salt(("dict-popup-card-body", card.generation))
+        .id_salt(("dict-popup-card-body", revision))
         .max_height(body_cap)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            card_body(ui, palette, ui_config, card, registry);
+            card_body(ui, palette, ui_config, state, registry, revision);
         });
 
     separator(ui, palette);
@@ -422,10 +338,10 @@ fn card_contents(
     close_clicked
 }
 
-fn card_header(ui: &mut egui::Ui, palette: &CardPalette, card: &CardState) {
-    let headline = ellipsize(&card.headline(), 80);
-    let (phonetic, _) = match &card.phase {
-        Phase::Ready(report) => report
+fn card_header(ui: &mut egui::Ui, palette: &CardPalette, state: &State) {
+    let headline = ellipsize(&state.headline(), 80);
+    let (phonetic, _) = match state {
+        State::Done(Outcome::Report(report)) => report
             .groups
             .first()
             .map(|group| split_phonetic(&group.entry.definition))
@@ -452,17 +368,13 @@ fn card_header(ui: &mut egui::Ui, palette: &CardPalette, card: &CardState) {
 
         if let Some(phonetic) = phonetic {
             ui.add(
-                egui::Label::new(
-                    RichText::new(phonetic)
-                        .monospace()
-                        .color(palette.muted),
-                )
-                .selectable(true),
+                egui::Label::new(RichText::new(phonetic).monospace().color(palette.muted))
+                    .selectable(true),
             );
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Phase::Ready(report) = &card.phase {
+            if let State::Done(Outcome::Report(report)) = state {
                 if let Some(first) = report.groups.first() {
                     chip(ui, first.direction.label(), palette.accent_text, palette.accent);
                 }
@@ -473,7 +385,7 @@ fn card_header(ui: &mut egui::Ui, palette: &CardPalette, card: &CardState) {
     // Second line: dictionary name + match metadata.
     ui.horizontal(|ui| {
         let mut source = String::new();
-        if let Phase::Ready(report) = &card.phase {
+        if let State::Done(Outcome::Report(report)) = state {
             if let Some(first) = report.groups.first() {
                 source = first.label.clone();
                 if first.matched != report.query {
@@ -486,7 +398,7 @@ fn card_header(ui: &mut egui::Ui, palette: &CardPalette, card: &CardState) {
             ui.label(RichText::new(source).small().color(palette.muted));
         }
 
-        if let Phase::Ready(report) = &card.phase {
+        if let State::Done(Outcome::Report(report)) = state {
             if report.groups.iter().any(|group| group.low_confidence) {
                 ui.label(
                     RichText::new("方向自动识别不确定")
@@ -502,30 +414,37 @@ fn card_body(
     ui: &mut egui::Ui,
     palette: &CardPalette,
     ui_config: &UiConfig,
-    card: &CardState,
+    state: &State,
     registry: &Registry,
+    revision: u64,
 ) {
-    match &card.phase {
-        Phase::Idle => {}
-        Phase::Querying { .. } => {
+    match state {
+        State::Idle => {}
+        State::Running { .. } => {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(15.0));
                 ui.label(RichText::new("正在读取选中文字…").color(palette.muted));
             });
             ui.add_space(6.0);
+            // Normally the card is hidden while a request runs; keep the
+            // spinner alive if it is ever visible in this state.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        Phase::Info(text) => {
+        State::Done(Outcome::Info(info)) => {
             ui.add_space(4.0);
-            ui.label(RichText::new(text).color(palette.text));
+            ui.label(RichText::new(&info.text).color(palette.text));
             ui.add_space(4.0);
         }
-        Phase::Failed(message) => {
+        State::Done(Outcome::Report(report)) => {
+            render_report(ui, palette, ui_config, report, registry, revision);
+        }
+        State::Failed(_) | State::TimedOut => {
             ui.add_space(4.0);
+            let message = state.failure_text().unwrap_or_default();
             ui.label(RichText::new(message).color(palette.danger));
             ui.add_space(4.0);
         }
-        Phase::Ready(report) => render_report(ui, palette, ui_config, report, registry, card),
     }
 }
 
@@ -535,7 +454,7 @@ fn render_report(
     ui_config: &UiConfig,
     report: &LookupReport,
     registry: &Registry,
-    card: &CardState,
+    revision: u64,
 ) {
     if report.groups.is_empty() {
         ui.add_space(4.0);
@@ -595,7 +514,7 @@ fn render_report(
         );
 
         egui::CollapsingHeader::new(RichText::new(header).color(palette.text))
-            .id_salt(("dict-popup-group", card.generation, index))
+            .id_salt(("dict-popup-group", revision, index))
             .default_open(default_open)
             .show(ui, |ui| {
                 let (_, definition) = split_phonetic(&group.entry.definition);
@@ -632,11 +551,8 @@ fn separator(ui: &mut egui::Ui, palette: &CardPalette) {
     ui.add_space(6.0);
     let rect = ui.available_rect_before_wrap();
     let y = rect.top();
-    ui.painter().hline(
-        rect.x_range(),
-        y,
-        Stroke::new(1.0, palette.divider),
-    );
+    ui.painter()
+        .hline(rect.x_range(), y, Stroke::new(1.0, palette.divider));
     ui.add_space(7.0);
 }
 
@@ -652,7 +568,8 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) {
 
 /// Pull a leading `/…/` or `[…]` phonetic off a definition, if the dictionary
 /// stored one inline. Pure so it can be unit tested.
-pub fn split_phonetic(definition: &str) -> (Option<String>, String) {    let trimmed = definition.trim_start();
+pub fn split_phonetic(definition: &str) -> (Option<String>, String) {
+    let trimmed = definition.trim_start();
     let mut chars = trimmed.chars();
     let Some(first) = chars.next() else {
         return (None, String::new());
@@ -714,22 +631,30 @@ pub fn clip_definition(definition: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
 
-    fn area(left: i32, top: i32, right: i32, bottom: i32) -> WorkArea {
-        WorkArea {
+    use dict_input::host::WorkArea;
+
+    fn area(left: i32, top: i32, right: i32, bottom: i32) -> Option<WorkArea> {
+        Some(WorkArea {
             left,
             top,
             right,
             bottom,
+        })
+    }
+
+    fn anchor(cursor: Option<(i32, i32)>, work_area: Option<WorkArea>, scale: f32) -> Anchor {
+        Anchor {
+            cursor,
+            work_area,
+            scale,
         }
     }
 
     #[test]
     fn places_below_and_right_of_the_cursor() {
         let pos = place_card(
-            Some((100, 100)),
-            Some(area(0, 0, 1920, 1080)),
+            anchor(Some((100, 100)), area(0, 0, 1920, 1080), 1.0),
             Vec2::new(400.0, 300.0),
-            1.0,
         );
         assert_eq!(pos, egui::pos2(116.0, 120.0));
     }
@@ -737,10 +662,8 @@ mod tests {
     #[test]
     fn flips_left_near_the_right_edge() {
         let pos = place_card(
-            Some((1900, 100)),
-            Some(area(0, 0, 1920, 1080)),
+            anchor(Some((1900, 100)), area(0, 0, 1920, 1080), 1.0),
             Vec2::new(400.0, 300.0),
-            1.0,
         );
         // 1900 + 16 + 400 > 1920 -> flip to the left of the cursor.
         assert!(pos.x < 1900.0, "expected a left flip, got {pos:?}");
@@ -750,10 +673,8 @@ mod tests {
     #[test]
     fn flips_up_near_the_bottom_edge() {
         let pos = place_card(
-            Some((100, 1060)),
-            Some(area(0, 0, 1920, 1080)),
+            anchor(Some((100, 1060)), area(0, 0, 1920, 1080), 1.0),
             Vec2::new(400.0, 300.0),
-            1.0,
         );
         assert!(pos.y < 1060.0, "expected an upward flip, got {pos:?}");
         assert!(pos.y + 300.0 <= 1080.0);
@@ -764,10 +685,8 @@ mod tests {
         // The card is bigger than the monitor: clamp to the work area plus the
         // shadow margin.
         let pos = place_card(
-            Some((5, 5)),
-            Some(area(0, 0, 300, 200)),
+            anchor(Some((5, 5)), area(0, 0, 300, 200), 1.0),
             Vec2::new(400.0, 300.0),
-            1.0,
         );
         assert_eq!(pos, egui::pos2(PAD, PAD));
     }
@@ -775,20 +694,44 @@ mod tests {
     #[test]
     fn divides_physical_pixels_by_the_monitor_scale() {
         let pos = place_card(
-            Some((200, 200)),
-            Some(area(0, 0, 3840, 2160)),
+            anchor(Some((200, 200)), area(0, 0, 3840, 2160), 2.0),
             Vec2::new(400.0, 300.0),
-            2.0,
         );
         assert_eq!(pos, egui::pos2(116.0, 120.0));
     }
 
     #[test]
+    fn the_anchor_scale_is_the_only_scale() {
+        // Cursor and work area are physical pixels on a 150% monitor: every
+        // coordinate must be divided by the anchor's scale.
+        let pos = place_card(
+            anchor(Some((300, 300)), area(0, 0, 3840, 2160), 1.5),
+            Vec2::new(400.0, 300.0),
+        );
+        assert_eq!(pos, egui::pos2(216.0, 220.0));
+    }
+
+    #[test]
+    fn a_broken_scale_falls_back_to_one() {
+        let expected = egui::pos2(116.0, 120.0);
+        for scale in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            let pos = place_card(
+                anchor(Some((100, 100)), area(0, 0, 1920, 1080), scale),
+                Vec2::new(400.0, 300.0),
+            );
+            assert_eq!(pos, expected, "scale {scale} must degrade to 1.0");
+        }
+    }
+
+    #[test]
     fn falls_back_without_a_cursor_or_monitor() {
-        let pos = place_card(None, None, Vec2::new(400.0, 300.0), 1.0);
+        let pos = place_card(Anchor::default(), Vec2::new(400.0, 300.0));
         assert_eq!(pos, egui::pos2(PAD + 64.0, PAD + 64.0));
 
-        let pos = place_card(Some((50, 60)), None, Vec2::new(400.0, 300.0), 2.0);
+        let pos = place_card(
+            anchor(Some((50, 60)), None, 2.0),
+            Vec2::new(400.0, 300.0),
+        );
         assert_eq!(pos, egui::pos2(41.0, 50.0));
     }
 
@@ -797,10 +740,8 @@ mod tests {
         // The window is PAD larger than the card on every side, so the visible
         // card lands exactly at cursor + (16, 20).
         let card_pos = place_card(
-            Some((100, 100)),
-            Some(area(0, 0, 1920, 1080)),
+            anchor(Some((100, 100)), area(0, 0, 1920, 1080), 1.0),
             Vec2::new(400.0, 300.0),
-            1.0,
         );
         assert_eq!(
             window_origin(card_pos),

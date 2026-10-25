@@ -6,16 +6,19 @@
 //! ```
 
 fn main() {
-    let before = dict_input::debug_clipboard_read();
+    let before = dict_input::diagnostics::clipboard_text();
     println!("before: {:?}", before);
 
-    dict_input::debug_clipboard_write("dict-popup clipboard probe");
-    let after = dict_input::debug_clipboard_read();
+    dict_input::diagnostics::write_clipboard("dict-popup clipboard probe");
+    let after = dict_input::diagnostics::clipboard_text();
     println!("after:  {:?}", after);
 
     if let Some(previous) = &before {
-        dict_input::debug_clipboard_write(previous);
-        println!("restored: {:?}", dict_input::debug_clipboard_read());
+        dict_input::diagnostics::write_clipboard(previous);
+        println!(
+            "restored: {:?}",
+            dict_input::diagnostics::clipboard_text()
+        );
     }
 
     let ok = after.as_deref() == Some("dict-popup clipboard probe");
