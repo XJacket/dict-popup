@@ -31,21 +31,47 @@ impl Level {
 static SINK: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// Open (and rotate) the log file. Safe to call once; later calls are ignored.
+///
+/// The preferred path is `%APPDATA%\dict-popup\dict-popup.log`. If that cannot
+/// be opened (permissions, redirected profile, sandbox), fall back to the
+/// executable's folder and then to the temp directory: a missing log is worse
+/// than a log in an unexpected place. `DICT_POPUP_LOG=<path>` overrides all of
+/// it (diagnostics).
 pub fn init(path: PathBuf) {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(dir);
+    let override_path = std::env::var_os("DICT_POPUP_LOG").map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = &override_path {
+        candidates.push(path.clone());
+    }
+    candidates.push(path.clone());
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("dict-popup.log"));
+        }
+    }
+    candidates.push(std::env::temp_dir().join("dict-popup.log"));
+
+    for candidate in candidates {
+        if let Some(dir) = candidate.parent() {
+            if !dir.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(dir);
+            }
+        }
+        rotate_if_needed(&candidate);
+
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&candidate)
+        {
+            let _ = SINK.set(Mutex::new(Some(file)));
+            info(format!("log file: {}", candidate.display()));
+            return;
         }
     }
 
-    rotate_if_needed(&path);
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok();
-    let _ = SINK.set(Mutex::new(file));
+    // Nothing writable: keep running without a log rather than crashing.
+    let _ = SINK.set(Mutex::new(None));
 }
 
 pub fn info(message: impl AsRef<str>) {

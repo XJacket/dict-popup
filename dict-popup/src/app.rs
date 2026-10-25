@@ -210,6 +210,7 @@ impl Shared {
     }
 
     fn on_selection_failed(&mut self, message: String) {
+        logging::warn(format!("selection failed: {message}"));
         if self.ignore_result {
             self.ignore_result = false;
             self.pending_hotkey = None;
