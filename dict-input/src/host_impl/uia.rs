@@ -201,6 +201,257 @@ fn worker_loop(jobs: Receiver<Job>, busy: Arc<AtomicBool>) {
     }
 }
 
+/// Diagnostic entry point: run both capture paths against the current
+/// foreground window and describe what happened.
+pub(crate) fn debug_capture_once(target_hwnd: Option<isize>) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowTextW};
+
+    // SAFETY: dedicated thread; COM is initialised and released in order, and
+    // every call below is read-only.
+    unsafe {
+        let init = if std::env::var("DICT_PROBE_STA").is_ok() {
+            CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED)
+        } else {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+        };
+
+        // UI Automation clients are expected to set process-wide security before
+        // creating the automation object; without it some providers only expose
+        // the window shell (FindAll then reports a single empty Pane).
+        {
+            use windows::Win32::System::Com::{
+                CoInitializeSecurity, EOLE_AUTHENTICATION_CAPABILITIES,
+                RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+            };
+            let hr = CoInitializeSecurity(
+                None,
+                -1,
+                None,
+                None,
+                RPC_C_AUTHN_LEVEL_DEFAULT,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOLE_AUTHENTICATION_CAPABILITIES(0),
+                None,
+            );
+            if hr.is_err() {
+                // Already initialised (e.g. by the runtime) - not fatal.
+            }
+        }
+        let target = match target_hwnd {
+            Some(hwnd) => HWND(hwnd as *mut core::ffi::c_void),
+            None => GetForegroundWindow(),
+        };
+
+        let mut class = [0u16; 256];
+        let mut title = [0u16; 256];
+        let class_len = GetClassNameW(target, &mut class);
+        let title_len = GetWindowTextW(target, &mut title);
+        let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
+        let title = String::from_utf16_lossy(&title[..title_len.max(0) as usize]);
+
+        let mut out = format!(
+            "CoInitializeEx: {init:?}\nforeground: 0x{:X} class='{class}' title='{title}'\n",
+            target.0 as isize
+        );
+
+        // Step-by-step clipboard diagnostics.
+        let seq_before = windows::Win32::System::DataExchange::GetClipboardSequenceNumber();
+        let text_before = clipboard::read_text();
+        out.push_str(&format!(
+            "clipboard before: seq={seq_before} text={:?}\n",
+            text_before.as_deref().map(|t| t.chars().take(20).collect::<String>())
+        ));
+        clipboard::wait_for_modifiers_released();
+        // Which control actually has keyboard focus right now?
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+            };
+            let mut pid = 0u32;
+            let thread_id = GetWindowThreadProcessId(target, Some(&mut pid));
+            let mut info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            if GetGUIThreadInfo(thread_id, &mut info).is_ok() {
+                out.push_str(&format!(
+                    "focus: hwndFocus=0x{:X} hwndActive=0x{:X}\n",
+                    info.hwndFocus.0 as isize, info.hwndActive.0 as isize
+                ));
+            }
+        }
+        match clipboard::send_ctrl_c() {
+            Ok(()) => out.push_str("SendInput: ok\n"),
+            Err(error) => out.push_str(&format!("SendInput: ERR {error}\n")),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let seq_after = windows::Win32::System::DataExchange::GetClipboardSequenceNumber();
+        let text_after = clipboard::read_text();
+        out.push_str(&format!(
+            "clipboard after:  seq={seq_after} changed={} text={:?}\n",
+            seq_after != seq_before,
+            text_after.as_deref().map(|t| t.chars().take(20).collect::<String>())
+        ));
+        let fg_after = GetForegroundWindow();
+        out.push_str(&format!(
+            "foreground after SendInput: 0x{:X} same={}\n",
+            fg_after.0 as isize,
+            fg_after == target
+        ));
+
+        // Restore whatever was there before the diagnostic.
+        if let Some(previous) = text_before {
+            clipboard::write_text(&previous);
+        }
+
+        match clipboard::capture() {
+            Ok(selection) => out.push_str(&format!(
+                "clipboard capture: OK, {} chars\n",
+                selection.text.chars().count()
+            )),
+            Err(error) => out.push_str(&format!("clipboard capture: ERR {error}\n")),
+        }
+
+        let mut slot: Option<IUIAutomation> = None;
+        let outcome = capture_job(&mut slot, init.is_ok(), target, false, init);
+        match outcome {
+            Ok(selection) => out.push_str(&format!(
+                "uia: OK, {} chars\n",
+                selection.text.chars().count()
+            )),
+            Err(error) => out.push_str(&format!("uia: ERR {error}\n")),
+        }
+
+        // Isolate FindAll from the condition: how many descendants does the
+        // provider report at all, and how many match Document/Edit?
+        if let Some(automation) = &slot {
+            if let Ok(root) = automation.ElementFromHandle(target) {
+                if let Ok(any) = automation.CreateTrueCondition() {
+                    if let Ok(found) = root.FindAll(TreeScope_Descendants, &any) {
+                        let count = found.Length().unwrap_or(-1);
+                        out.push_str(&format!("uia descendants (no condition): {count}\n"));
+                        for index in 0..count.min(8) {
+                            if let Ok(element) = found.GetElement(index) {
+                                let control = element.CurrentControlType().map(|t| t.0).unwrap_or(-1);
+                                let class = element
+                                    .CurrentClassName()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                let has_text = element
+                                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                                    .is_ok();
+                                out.push_str(&format!(
+                                    "  descendant[{index}]: type={control} class='{class}' text={has_text}\n"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Ok(condition) = text_surface_condition(automation) {
+                    if let Ok(found) = root.FindAll(TreeScope_Descendants, &condition) {
+                        out.push_str(&format!(
+                            "uia descendants (Document|Edit): {}\n",
+                            found.Length().unwrap_or(-1)
+                        ));
+                    }
+                }
+                if let Ok(children_cond) = automation.CreateTrueCondition() {
+                    if let Ok(found) = root.FindAll(TreeScope_Children, &children_cond) {
+                        out.push_str(&format!(
+                            "uia direct children: {}\n",
+                            found.Length().unwrap_or(-1)
+                        ));
+                    }
+                }
+
+                // Walk the *control view* with the tree walker. Some providers
+                // (XAML) expose nothing to FindAll but answer walkers.
+                if let Ok(walker) = automation.ControlViewWalker() {
+                    let mut depth = 0usize;
+                    let mut budget = 40usize;
+                    walk_dump(&walker, &root, 0, &mut depth, &mut budget, &mut out);
+                    out.push_str(&format!("uia walker nodes: {depth}\n"));
+                }
+            }
+        }
+
+        // Alternative entry point: the desktop root, filtered by process id.
+        if let Some(automation) = &slot {
+            let mut pid = 0u32;
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                target,
+                Some(&mut pid),
+            );
+            if let Ok(desktop) = automation.GetRootElement() {
+                if let Ok(condition) = text_surface_condition(automation) {
+                    if let Ok(found) = desktop.FindAll(TreeScope_Descendants, &condition) {
+                        let count = found.Length().unwrap_or(-1);
+                        out.push_str(&format!(
+                            "desktop search (Document|Edit): {count} (want pid {pid})\n"
+                        ));
+                        for index in 0..count.min(6) {
+                            if let Ok(element) = found.GetElement(index) {
+                                let element_pid = element.CurrentProcessId().unwrap_or(-1);
+                                let class = element
+                                    .CurrentClassName()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                out.push_str(&format!(
+                                    "  doc[{index}]: pid={element_pid} class='{class}'\n"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Release every COM object before uninitialising the apartment.
+        drop(slot);
+        CoUninitialize();
+        out
+    }
+}
+
+/// Recursively dump the control-view tree (diagnostics).
+fn walk_dump(
+    walker: &windows::Win32::UI::Accessibility::IUIAutomationTreeWalker,
+    element: &IUIAutomationElement,
+    depth: usize,
+    seen: &mut usize,
+    budget: &mut usize,
+    out: &mut String,
+) {
+    if depth > 5 || *budget == 0 {
+        return;
+    }
+    // SAFETY: walker and element are live on this thread.
+    unsafe {
+        let Ok(child) = walker.GetFirstChildElement(element) else {
+            return;
+        };
+        let mut current = Some(child);
+        while let Some(node) = current {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            *seen += 1;
+            let control = node.CurrentControlType().map(|t| t.0).unwrap_or(-1);
+            let class = node.CurrentClassName().map(|s| s.to_string()).unwrap_or_default();
+            let has_text = node
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                .is_ok();
+            out.push_str(&format!(
+                "  walker[{depth}] type={control} class='{class}' text={has_text}\n"
+            ));
+            walk_dump(walker, &node, depth + 1, seen, budget, out);
+            current = walker.GetNextSiblingElement(&node).ok();
+        }
+    }
+}
+
 /// One capture job: clipboard first (unless disabled), UI Automation second.
 fn capture_job(
     automation_slot: &mut Option<IUIAutomation>,
@@ -515,9 +766,20 @@ unsafe fn text_surface_condition(
     }
     .map_err(|error| format!("CreatePropertyCondition(Edit)：{}", error.message()))?;
 
-    let condition: IUIAutomationCondition =
+    let text_surfaces: IUIAutomationCondition =
         unsafe { automation.CreateOrCondition(&document, &edit) }
             .map_err(|error| format!("CreateOrCondition：{}", error.message()))?;
+
+    // FindAll walks the *raw* view by default. XAML providers (Windows 11
+    // Notepad, WinUI) expose their real content only in the control view: the
+    // raw view shows a single empty Pane. Intersecting with the control-view
+    // condition is what makes those apps work.
+    let control_view = unsafe { automation.ControlViewCondition() }
+        .map_err(|error| format!("ControlViewCondition：{}", error.message()))?;
+
+    let condition: IUIAutomationCondition =
+        unsafe { automation.CreateAndCondition(&text_surfaces, &control_view) }
+            .map_err(|error| format!("CreateAndCondition：{}", error.message()))?;
     Ok(condition)
 }
 

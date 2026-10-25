@@ -46,3 +46,16 @@ pub fn debug_clipboard_read() -> Option<String> {
 pub fn debug_clipboard_write(text: &str) {
     host_impl::debug_clipboard_write(text)
 }
+
+/// Run the whole capture pipeline against the current foreground window and
+/// describe the result (diagnostics only; `examples/capture_probe.rs`).
+#[doc(hidden)]
+pub fn debug_capture_once(hwnd: Option<isize>) -> String {
+    host_impl::debug_capture_once(hwnd)
+}
+
+/// Type text into whatever has focus, using `KEYEVENTF_UNICODE` (diagnostics).
+#[doc(hidden)]
+pub fn debug_type_text(text: &str) -> usize {
+    host_impl::debug_type_text(text)
+}

@@ -66,7 +66,35 @@ pub(crate) fn capture() -> Result<Selection, SelectionError> {
 
     match captured {
         Some(text) if !text.trim().is_empty() => Ok(Selection { text }),
-        _ => Err(SelectionError::EmptySelection),
+        _ => Err(SelectionError::Automation(format!(
+            "剪贴板未更新：{}",
+            diagnostics(sequence_before)
+        ))),
+    }
+}
+
+/// Human-readable state for a failed copy: which window was in front, and
+/// whether the clipboard sequence moved at all. This is what turns "取词失败"
+/// into something diagnosable from the log.
+fn diagnostics(sequence_before: u32) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
+
+    // SAFETY: read-only queries with stack buffers of the declared size.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        let after = GetClipboardSequenceNumber();
+        format!(
+            "前台窗口 class='{class}' hwnd=0x{:X}；剪贴板序号 {sequence_before}→{after}（{}）",
+            hwnd.0 as isize,
+            if after == sequence_before {
+                "Ctrl+C 未生效"
+            } else {
+                "剪贴板变了但没有文本"
+            }
+        )
     }
 }
 
@@ -159,7 +187,7 @@ unsafe fn read_clipboard_text() -> Option<String> {
 ///
 /// Without this the synthesized `Ctrl+C` arrives while the hotkey's own
 /// modifiers are still down, and applications treat it as `Ctrl+Alt+C`.
-fn wait_for_modifiers_released() {
+pub(crate) fn wait_for_modifiers_released() {
     const KEYS: [u16; 5] = [VK_CONTROL.0, VK_MENU.0, VK_SHIFT.0, VK_LWIN.0, VK_RWIN.0];
     let deadline = Instant::now() + Duration::from_millis(600);
 
@@ -175,23 +203,68 @@ fn wait_for_modifiers_released() {
     }
 }
 
-fn send_ctrl_c() -> Result<(), SelectionError> {    let inputs = [
-        key_input(VK_CONTROL, false),
-        key_input(VIRTUAL_KEY(b'C' as u16), false),
-        key_input(VIRTUAL_KEY(b'C' as u16), true),
-        key_input(VK_CONTROL, true),
-    ];
+/// Diagnostic: type text with `KEYEVENTF_UNICODE` (no virtual keys involved).
+/// Returns how many characters the API accepted.
+pub(crate) fn debug_type_text(text: &str) -> usize {
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_UNICODE;
 
-    // SAFETY: `inputs` is a valid array of INPUT records of the declared size.
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent as usize == inputs.len() {
-        Ok(())
-    } else {
-        Err(SelectionError::Automation(format!(
-            "无法发送 Ctrl+C（SendInput 返回 {sent}/{}）",
-            inputs.len()
-        )))
+    let mut accepted = 0usize;
+    for ch in text.chars() {
+        for up in [false, true] {
+            let mut encode = [0u16; 2];
+            let units = ch.encode_utf16(&mut encode);
+            for unit in units {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: *unit,
+                            dwFlags: if up {
+                                KEYBD_EVENT_FLAGS(KEYEVENTF_KEYUP.0 | KEYEVENTF_UNICODE.0)
+                            } else {
+                                KEYBD_EVENT_FLAGS(KEYEVENTF_UNICODE.0)
+                            },
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                // SAFETY: one fully initialised INPUT record of the declared size.
+                let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+                accepted += sent as usize;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+    accepted
+}
+
+pub(crate) fn send_ctrl_c() -> Result<(), SelectionError> {
+    // One SendInput call with Ctrl-down, C-down, C-up, Ctrl-up in a single
+    // array is acknowledged by the API but many applications coalesce it and
+    // never see the chord. Injecting the four events separately with a small
+    // gap is what a human typing the shortcut produces, and is recognised.
+    const GAP: Duration = Duration::from_millis(25);
+
+    for (key, up) in [
+        (VK_CONTROL, false),
+        (VIRTUAL_KEY(b'C' as u16), false),
+        (VIRTUAL_KEY(b'C' as u16), true),
+        (VK_CONTROL, true),
+    ] {
+        let inputs = [key_input(key, up)];
+        // SAFETY: `inputs` is one fully initialised INPUT of the declared size.
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            return Err(SelectionError::Automation(format!(
+                "无法发送 Ctrl+C（SendInput 返回 {sent}/1）"
+            )));
+        }
+        std::thread::sleep(GAP);
+    }
+
+    Ok(())
 }
 
 fn key_input(key: VIRTUAL_KEY, up: bool) -> INPUT {

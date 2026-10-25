@@ -40,6 +40,14 @@ pub(crate) fn debug_clipboard_write(text: &str) {
     clipboard::write_text(text);
 }
 
+pub(crate) fn debug_capture_once(target_hwnd: Option<isize>) -> String {
+    uia::debug_capture_once(target_hwnd)
+}
+
+pub(crate) fn debug_type_text(text: &str) -> usize {
+    clipboard::debug_type_text(text)
+}
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
