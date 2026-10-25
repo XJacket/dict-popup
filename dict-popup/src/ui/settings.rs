@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use egui::{RichText, ViewportCommand};
 
 use dict_input::hotkey::{Hotkey, HotkeyError, Modifiers, VirtualKey};
+use dict_input::ProcessPrivilege;
 
 use crate::app::{NoticeLevel, Shared};
 use crate::config::{Config, DictionaryConfig, DirectionSpec, ThemeMode};
@@ -772,6 +773,9 @@ fn about_section(ui: &mut egui::Ui, shared: &mut Shared) {
             env!("CARGO_PKG_VERSION")
         ));
 
+        // Informational only: capture never requires UIAccess.
+        ui.label(privilege_status_line(&shared.privilege));
+
         let config_path = shared.config_path.clone();
         ui.horizontal(|ui| {
             ui.label("配置：");
@@ -804,6 +808,23 @@ fn about_section(ui: &mut egui::Ui, shared: &mut Shared) {
                 .weak(),
         );
     });
+}
+
+/// The read-only privilege line in the About panel, e.g.
+/// `UIAccess: 未启用 · 完整性: Medium`.
+///
+/// Pure so the exact wording and the enabled/disabled distinction are covered
+/// by a unit test; the value itself is sampled once at startup.
+fn privilege_status_line(privilege: &ProcessPrivilege) -> String {
+    format!(
+        "UIAccess: {} · 完整性: {}",
+        if privilege.uiaccess {
+            "已启用"
+        } else {
+            "未启用"
+        },
+        privilege.integrity
+    )
 }
 
 fn open_parent(path: &std::path::Path, shared: &mut Shared) {
@@ -922,5 +943,27 @@ mod tests {
         let cut = truncate(&long, 5);
         assert_eq!(cut.chars().count(), 6); // 5 + ellipsis
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn privilege_status_is_one_chinese_line() {
+        let enabled = ProcessPrivilege {
+            uiaccess: true,
+            elevated: false,
+            integrity: dict_input::Integrity::High,
+        };
+        assert_eq!(
+            privilege_status_line(&enabled),
+            "UIAccess: 已启用 · 完整性: High"
+        );
+
+        let disabled = ProcessPrivilege {
+            uiaccess: false,
+            elevated: false,
+            integrity: dict_input::Integrity::Medium,
+        };
+        let line = privilege_status_line(&disabled);
+        assert_eq!(line, "UIAccess: 未启用 · 完整性: Medium");
+        assert!(!line.contains('\n'), "the status must stay one line");
     }
 }

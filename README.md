@@ -30,6 +30,13 @@
 > 这是未签名开源软件的预期行为，可点「更多信息 → 仍要运行」。
 > 若在**普通权限**下取不到词，见下方[已知限制](#已知限制)。
 
+### 安装为 UIAccess 应用
+
+UIAccess 让本程序能向**以管理员身份运行**的窗口发送合成输入，在提权程序里也能取词。
+它要求**已签名**的构建，因此未签名的 `0.2.0` release 不提供；自行签名后，在管理员 PowerShell 里运行
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-uiaaccess.ps1`，
+再从开始菜单正常启动（不要用「以管理员身份运行」）。详见 [docs/UIAACCESS.md](docs/UIAACCESS.md)。
+
 ## 首次配置
 
 设置 → 词典 → 添加 `.ifo` 文件，指向你的 StarDict 词典，例如：

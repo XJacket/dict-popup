@@ -10,6 +10,20 @@
 // Application icon. Also used for the tray icon at runtime.
 1 ICON "dict-popup.ico"
 
+// Application manifest: RT_MANIFEST is resource type 24, and Windows only
+// reads id 1. windres embeds the chosen file verbatim, so the manifest's XML
+// reaches the binary unchanged.
+//
+// The default build embeds uiAccess="false". build.bat /uiaccess (or
+// DICT_POPUP_UIACCESS=1) passes -D DICT_POPUP_UIACCESS to windres, which
+// selects the uiAccess="true" manifest for signed builds only: an unsigned
+// binary that requests UIAccess does not start.
+#ifdef DICT_POPUP_UIACCESS
+1 24 "dict-popup.manifest"
+#else
+1 24 "dict-popup-no-uiaccess.manifest"
+#endif
+
 1 VERSIONINFO
   FILEVERSION     0,2,0,0
   PRODUCTVERSION  0,2,0,0

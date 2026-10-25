@@ -26,6 +26,7 @@ use crate::capture::pipeline::{self, Observer, Strategy as PipelineStrategy, Str
 use crate::capture::uia::{self, SampleLimits};
 use crate::capture::win32::{self, Win32Env};
 use crate::capture::{CaptureEnv, CaptureFailure, CaptureTarget, CapturedText, TrimSelection};
+use crate::privilege::{self, Integrity};
 
 /// Upper bound for the UIA tree sample's depth.
 const TREE_MAX_DEPTH: usize = 4;
@@ -242,6 +243,13 @@ pub struct Report {
     pub target_window: Option<isize>,
     /// Class name of the window that held the foreground when the run started.
     pub foreground_class: Option<String>,
+    /// Whether the process token carries UIAccess. Informational: capture works
+    /// without it, but synthetic `Ctrl+C` cannot cross integrity levels.
+    pub uiaccess: bool,
+    /// Whether the process token is elevated.
+    pub elevated: bool,
+    /// The process token's mandatory integrity level.
+    pub integrity: Integrity,
     /// The strategy that produced the captured text, if any.
     pub chosen: Option<Strategy>,
     /// The run's final result.
@@ -284,6 +292,11 @@ impl fmt::Display for Report {
             Some(class) => writeln!(f, "  foreground class: '{class}'")?,
             None => writeln!(f, "  foreground class: <unknown>")?,
         }
+        writeln!(
+            f,
+            "  privilege: uiaccess={} elevated={} integrity={}",
+            self.uiaccess, self.elevated, self.integrity
+        )?;
         writeln!(
             f,
             "  clipboard sequence: {} -> {} ({})",
@@ -375,6 +388,7 @@ impl fmt::Display for Report {
 /// given. The pipeline's own order, deadlines, and clipboard restore are
 /// untouched.
 pub fn run(target: Option<CaptureTarget>) -> Report {
+    let privilege = privilege::current();
     let foreground = win32::foreground_window();
     let foreground_class = foreground.and_then(win32::class_name);
     let capture_target = target
@@ -405,6 +419,9 @@ pub fn run(target: Option<CaptureTarget>) -> Report {
     Report {
         target_window: window,
         foreground_class,
+        uiaccess: privilege.uiaccess,
+        elevated: privilege.elevated,
+        integrity: privilege.integrity,
         chosen: pipeline_run.chosen,
         outcome: pipeline_run.outcome,
         attempts: pipeline_run.attempts,
@@ -783,6 +800,9 @@ mod tests {
         let report = Report {
             target_window: Some(0x1234),
             foreground_class: Some("Notepad".to_string()),
+            uiaccess: false,
+            elevated: true,
+            integrity: Integrity::High,
             chosen: Some(Strategy::CtrlC),
             outcome: Outcome::Captured { chars: 5 },
             attempts: vec![
@@ -813,6 +833,10 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("target window: 0x1234"), "{text}");
         assert!(text.contains("foreground class: 'Notepad'"), "{text}");
+        assert!(
+            text.contains("privilege: uiaccess=false elevated=true integrity=High"),
+            "{text}"
+        );
         assert!(text.contains("clipboard sequence: 10 -> 12 (changed)"), "{text}");
         assert!(text.contains("1. Pot: failed (NoSelection)"), "{text}");
         assert!(text.contains("2. Ctrl+C: captured 5 chars"), "{text}");
@@ -827,6 +851,9 @@ mod tests {
         let report = Report {
             target_window: None,
             foreground_class: None,
+            uiaccess: false,
+            elevated: false,
+            integrity: Integrity::Unknown,
             chosen: None,
             outcome: Outcome::Failed(CaptureFailure::NoTextPattern),
             attempts: vec![Attempt {
@@ -870,6 +897,10 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("target window: <none>"), "{text}");
         assert!(text.contains("foreground class: <unknown>"), "{text}");
+        assert!(
+            text.contains("privilege: uiaccess=false elevated=false integrity=Unknown"),
+            "{text}"
+        );
         assert!(text.contains("clipboard sequence: 7 -> 7 (unchanged)"), "{text}");
         assert!(text.contains("chosen: <none>"), "{text}");
         assert!(text.contains("uia tree sample: 1 nodes, truncated"), "{text}");

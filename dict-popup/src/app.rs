@@ -20,7 +20,7 @@ use eframe::egui;
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
 
 use dict_input::host::{Anchor, Command, Event, Host};
-use dict_input::{CaptureFailure, Hotkey, TrayAction};
+use dict_input::{CaptureFailure, Hotkey, ProcessPrivilege, TrayAction};
 
 use crate::config::Config;
 use crate::dictionaries::Registry;
@@ -77,6 +77,8 @@ pub struct Shared {
     pub hotkey: Hotkey,
     pub config_path: PathBuf,
     pub config_error: Option<String>,
+    /// Sampled once at startup; shown read-only in the About section.
+    pub privilege: ProcessPrivilege,
     pub font: FontInstall,
     pub notices: Vec<Notice>,
     pub registry: Registry,
@@ -504,6 +506,8 @@ pub struct Startup {
     pub hotkey: Hotkey,
     pub config_path: PathBuf,
     pub config_error: Option<String>,
+    /// Process token facts, sampled by `main` before eframe starts.
+    pub privilege: ProcessPrivilege,
     pub host: Option<Host>,
     pub host_error: Option<String>,
     /// E.g. "the configured hotkey was invalid, the default is in use".
@@ -526,6 +530,7 @@ impl App {
             hotkey: startup.hotkey,
             config_path: startup.config_path,
             config_error: startup.config_error.clone(),
+            privilege: startup.privilege,
             font,
             notices: Vec::new(),
             registry: Registry::empty(),

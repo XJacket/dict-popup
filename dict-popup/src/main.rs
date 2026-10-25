@@ -37,6 +37,11 @@ fn main() -> eframe::Result<()> {
         env!("CARGO_PKG_VERSION")
     ));
 
+    // One informational line: UIAccess is opt-in and never required. Capture
+    // keeps working without it; the diagnostic probe reports the same fields.
+    let privilege = dict_input::privilege::current();
+    logging::info(format!("privilege: {privilege}"));
+
     // ---- config (needed before the host, for the hotkey) ------------------
     let (config, config_path, config_error) = match config::Config::load() {
         Ok(config) => (config, config::config_path(), None),
@@ -109,6 +114,7 @@ fn main() -> eframe::Result<()> {
         hotkey,
         config_path,
         config_error,
+        privilege,
         host,
         host_error,
         hotkey_notice,
