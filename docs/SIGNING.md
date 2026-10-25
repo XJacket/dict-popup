@@ -27,7 +27,7 @@ Windows 会提示"未知发布者 / 此应用已被阻止"，这是未签名开�
 
 | 项 | 值 |
 |---|---|
-| 仓库 | `https://github.com/xujiake51/dict-popup` |
+| 仓库 | `https://github.com/XJacket/dict-popup` |
 | 许可证 | MIT |
 | 产物 | `dist/dict-popup.exe`（单文件，Windows x64） |
 | 构建命令 | `build.bat`（内部：`cargo build --release` + `windres` 资源链接） |
