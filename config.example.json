@@ -3,7 +3,7 @@
   "hotkey": "Ctrl+Alt+D",
   "dictionaries": [
     {
-      "path": "D:\\program\\GoldenDict-ng\\dicts\\ecdict\\stardict-ecdict-2.4.2.ifo",
+      "path": "C:\\dicts\\ecdict\\stardict-ecdict.ifo",
       "label": "ECDICT 简明英汉",
       "enabled": true,
       "direction": "auto"

@@ -1,0 +1,86 @@
+name: Release
+
+# Builds the binary and publishes a GitHub Release.
+#
+# Code signing through SignPath Foundation is wired in but DISABLED until the
+# application is approved. When approved:
+#   1. add repository secrets SIGNPATH_API_TOKEN and SIGNPATH_ORGANIZATION_ID
+#   2. set the two SIGNPATH_* env values below to the slugs from SignPath
+#   3. flip `if: false` to `if: true` on the signing steps
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  SIGNPATH_ORGANIZATION_ID: ''          # e.g. 0b6c1c1e-...
+  SIGNPATH_PROJECT_SLUG: dict-popup
+  SIGNPATH_SIGNING_POLICY_SLUG: release-signing
+  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: exe
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (GNU toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Use the GNU toolchain
+        shell: pwsh
+        run: rustup default stable-x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmd /c build.bat
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1 -SkipBuild
+
+      - name: Upload unsigned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dict-popup-unsigned
+          path: dist/dict-popup.exe
+          if-no-files-found: error
+
+      # ---- SignPath Foundation (enable after approval) --------------------
+      - name: Submit signing request
+        if: false
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ env.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed
+
+      - name: Replace binary with signed one
+        if: false
+        shell: pwsh
+        run: |
+          Copy-Item dist\signed\dict-popup.exe dist\dict-popup.exe -Force
+          Get-AuthenticodeSignature dist\dict-popup.exe | Format-List Status, SignerCertificate
+
+      - name: Package
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1 -SkipBuild
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dict-popup-*-win64.zip
+          generate_release_notes: true

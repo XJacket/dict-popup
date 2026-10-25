@@ -26,11 +26,13 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 rem --- toolchain --------------------------------------------------------------
-set "CARGO_BIN=C:\Users\xujia\.cargo\bin"
-set "RUSTUP_BIN=C:\Users\xujia\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin"
+rem cargo/rustc are normally found through the rustup proxy in %USERPROFILE%\.cargo\bin.
+rem No MSVC / Windows SDK is needed: linking uses the MinGW toolchain below or on PATH.
+set "CARGO_BIN=%USERPROFILE%\.cargo\bin"
 set "MINGW_BIN=%ROOT%\tools\mingw64\bin"
 
-if exist "%MINGW_BIN%\windres.exe" set "PATH=%CARGO_BIN%;%RUSTUP_BIN%;%MINGW_BIN%;%PATH%"
+set "PATH=%PATH%;%CARGO_BIN%"
+if exist "%MINGW_BIN%\windres.exe" set "PATH=%PATH%;%MINGW_BIN%"
 
 where cargo    >nul 2>nul || goto :no_cargo
 where windres  >nul 2>nul || goto :no_windres
