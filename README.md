@@ -17,7 +17,12 @@
 
 ## 安装
 
-1. 从 [Releases](../../releases) 下载 `dict-popup-<version>-win64.zip`
+> **项目仍在开发中，尚未发布预编译版本。** 目前请从源码构建（见下节）。
+> 功能未完成的部分见 [已知限制](#已知限制) 与 [issue 列表](../../issues)。
+
+发布后的安装方式（预留给首个 release）：
+
+1. 下载 `dict-popup-<version>-win64.zip`
 2. 解压到**任意普通目录**（例如 `C:\Users\<you>\Apps\dict-popup`）
    - ⚠️ 不要把 exe 放在被系统标记为「低完整性」的目录里（某些沙箱/受限目录），
      否则 Windows 会阻止它向其他程序发送按键，取词会失败。程序启动时会自检并提示。
