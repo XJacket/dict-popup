@@ -45,17 +45,47 @@ pub(crate) fn capture() -> Result<Selection, SelectionError> {
 
     let deadline = Instant::now() + COPY_TIMEOUT;
     let mut captured = None;
+    let mut read_failure: Option<&'static str> = None;
     while Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
         // The sequence number only changes when the clipboard is written, which
         // is exactly the signal that the copy happened (or that nothing did).
         if unsafe { GetClipboardSequenceNumber() } != sequence_before {
-            if let Some(text) = read_text() {
-                captured = Some(text);
-                break;
+            match read_text_detailed() {
+                Ok(text) => {
+                    captured = Some(text);
+                    break;
+                }
+                Err(reason) => read_failure = Some(reason),
             }
         }
     }
+
+    // Fallback that does not rely on synthetic input reaching the target: ask
+    // the focused control to copy itself. Standard edit controls (Notepad,
+    // dialogs, many IDE editors) honour WM_COPY across processes.
+    if captured.is_none() && unsafe { GetClipboardSequenceNumber() } == sequence_before {
+        if send_wm_copy() {
+            let fallback_deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < fallback_deadline {
+                std::thread::sleep(POLL_INTERVAL);
+                if unsafe { GetClipboardSequenceNumber() } != sequence_before {
+                    match read_text_detailed() {
+                        Ok(text) => {
+                            captured = Some(text);
+                            break;
+                        }
+                        Err(reason) => read_failure = Some(reason),
+                    }
+                }
+            }
+        }
+    }
+
+    // Sample the sequence BEFORE restoring our own clipboard text: the restore
+    // itself bumps the counter and would otherwise make a failed copy look like
+    // a successful one.
+    let sequence_after_copy = unsafe { GetClipboardSequenceNumber() };
 
     // Put the user's own clipboard back before doing anything else.
     if let Some(previous) = previous.as_deref() {
@@ -66,17 +96,28 @@ pub(crate) fn capture() -> Result<Selection, SelectionError> {
 
     match captured {
         Some(text) if !text.trim().is_empty() => Ok(Selection { text }),
-        _ => Err(SelectionError::Automation(format!(
-            "剪贴板未更新：{}",
-            diagnostics(sequence_before)
-        ))),
+        _ => {
+            let mut message = format!(
+                "剪贴板未更新：{}；注入{}",
+                diagnostics(sequence_before, sequence_after_copy),
+                if sequence_after_copy == sequence_before {
+                    "未到达目标窗口（前台程序的控件没有收到 Ctrl+C）"
+                } else {
+                    "到达了，但读不到文本"
+                }
+            );
+            if let Some(reason) = read_failure {
+                message.push_str(&format!("；读取失败：{reason}"));
+            }
+            Err(SelectionError::Automation(message))
+        }
     }
 }
 
 /// Human-readable state for a failed copy: which window was in front, and
 /// whether the clipboard sequence moved at all. This is what turns "取词失败"
 /// into something diagnosable from the log.
-fn diagnostics(sequence_before: u32) -> String {
+fn diagnostics(sequence_before: u32, sequence_after_copy: u32) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
 
     // SAFETY: read-only queries with stack buffers of the declared size.
@@ -85,35 +126,78 @@ fn diagnostics(sequence_before: u32) -> String {
         let mut class = [0u16; 128];
         let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
         let class = String::from_utf16_lossy(&class[..len]);
-        let after = GetClipboardSequenceNumber();
         format!(
-            "前台窗口 class='{class}' hwnd=0x{:X}；剪贴板序号 {sequence_before}→{after}（{}）",
-            hwnd.0 as isize,
-            if after == sequence_before {
-                "Ctrl+C 未生效"
-            } else {
-                "剪贴板变了但没有文本"
-            }
+            "前台窗口 class='{class}' hwnd=0x{:X}；剪贴板序号 {sequence_before}→{sequence_after_copy}",
+            hwnd.0 as isize
         )
+    }
+}
+
+/// Ask the focused control of the foreground window to copy itself (`WM_COPY`).
+/// Returns false when there is no focus window to talk to.
+fn send_wm_copy() -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, SendMessageW, GUITHREADINFO,
+        WM_COPY,
+    };
+
+    // SAFETY: read-only queries plus one documented message; all handles are
+    // checked before use.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        let thread = GetWindowThreadProcessId(foreground, Some(&mut pid));
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(thread, &mut info).is_err() || info.hwndFocus.is_invalid() {
+            return false;
+        }
+        SendMessageW(info.hwndFocus, WM_COPY, WPARAM(0), LPARAM(0));
+        true
     }
 }
 
 /// Whether the clipboard still holds the text we captured (used by the tests
 /// and diagnostics only).
 pub(crate) fn read_text() -> Option<String> {
+    read_text_detailed().ok()
+}
+
+/// Like [`read_text`] but says *why* it failed. The failure reason is what makes
+/// "剪贴板未更新" diagnosable.
+pub(crate) fn read_text_detailed() -> Result<String, &'static str> {
+    let mut last_error = "OpenClipboard 一直被占用";
+
     for _ in 0..OPEN_ATTEMPTS {
         // SAFETY: null owner is allowed for clipboard access.
         if unsafe { OpenClipboard(None) }.is_ok() {
-            // SAFETY: the clipboard is open; the handle is owned by it and must
-            // not be freed by us.
-            let text = unsafe { read_clipboard_text() };
+            // SAFETY: the clipboard is open; handles are owned by it.
+            let result = unsafe { read_clipboard_text() };
             // SAFETY: balances the successful OpenClipboard above.
             let _ = unsafe { CloseClipboard() };
-            return text;
+            return result.map_err(|reason| match reason {
+                ClipboardReadError::NoUnicodeText => "剪贴板里没有 CF_UNICODETEXT",
+                ClipboardReadError::LockFailed => "GlobalLock 失败",
+                ClipboardReadError::Empty => "剪贴板文本为空",
+            });
         }
+        last_error = "OpenClipboard 一直被占用";
         std::thread::sleep(Duration::from_millis(12));
     }
-    None
+
+    Err(last_error)
+}
+
+enum ClipboardReadError {
+    NoUnicodeText,
+    LockFailed,
+    Empty,
 }
 
 /// Replace the clipboard text. Best effort: failures are ignored on purpose
@@ -155,15 +239,16 @@ pub(crate) fn write_text(text: &str) {
 /// # Safety
 ///
 /// The clipboard must be open on this thread.
-unsafe fn read_clipboard_text() -> Option<String> {
+unsafe fn read_clipboard_text() -> Result<String, ClipboardReadError> {
     // SAFETY: the clipboard is open, so this returns the current text handle.
-    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?;
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
+        .map_err(|_| ClipboardReadError::NoUnicodeText)?;
     let global = HGLOBAL(handle.0);
 
     // SAFETY: `global` is a text handle owned by the clipboard.
     let pointer = unsafe { GlobalLock(global) };
     if pointer.is_null() {
-        return None;
+        return Err(ClipboardReadError::LockFailed);
     }
 
     // SAFETY: the block is a NUL-terminated UTF-16 string owned by the clipboard.
@@ -179,7 +264,10 @@ unsafe fn read_clipboard_text() -> Option<String> {
         let slice = std::slice::from_raw_parts(wide, length);
         let text = String::from_utf16_lossy(slice);
         let _ = GlobalUnlock(global);
-        Some(text)
+        if text.is_empty() {
+            return Err(ClipboardReadError::Empty);
+        }
+        Ok(text)
     }
 }
 

@@ -59,3 +59,10 @@ pub fn debug_capture_once(hwnd: Option<isize>) -> String {
 pub fn debug_type_text(text: &str) -> usize {
     host_impl::debug_type_text(text)
 }
+
+/// Run one clipboard capture and return the text, or the failure message.
+/// Used by the regression test that drives a real edit control.
+#[doc(hidden)]
+pub fn debug_capture_selection() -> Result<String, String> {
+    host_impl::debug_capture_selection()
+}

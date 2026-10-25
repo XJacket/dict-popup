@@ -48,6 +48,13 @@ pub(crate) fn debug_type_text(text: &str) -> usize {
     clipboard::debug_type_text(text)
 }
 
+/// Run the clipboard capture once and return the text or the error message.
+pub(crate) fn debug_capture_selection() -> Result<String, String> {
+    clipboard::capture()
+        .map(|selection| selection.text)
+        .map_err(|error| error.to_string())
+}
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
