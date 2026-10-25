@@ -29,7 +29,7 @@
 | 获取 org id / project slug / policy slug | ⬜ 待批准 | SignPath 后台给出 |
 | 配置仓库 secrets | ⬜ 待批准 | `SIGNPATH_API_TOKEN`、`SIGNPATH_ORGANIZATION_ID` |
 | 开启 workflow 签名步骤 | ⬜ 待批准 | 两个 `if: false` → `if: true` |
-| 签名后验证普通权限取词 | ⬜ 待验证 | 这是真正的完成条件 |
+| 签名后验证普通权限取词 | ✅ **机制已验证**（2026-10-25，自签） | `uiaccess=true elevated=false integrity=High`，提权记事本取词成功；等 SignPath 正式签名复验 |
 
 ## 每 12 小时应当做的事
 

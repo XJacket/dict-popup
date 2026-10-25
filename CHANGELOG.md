@@ -5,6 +5,23 @@
 格式参考 [Keep a Changelog 1.1.0](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **UIAccess 支持**（`build.bat /uiaccess`）：manifest 声明 + 签名 + 安装到 `%ProgramFiles%`
+  后，进程被提升到 High 完整性级别，可以跨过 UIPI 往提权窗口注入合成输入。
+  默认构建仍为 `uiAccess="false"`（未签名时带 `true` 会**无法启动**）。
+- `dict-input/src/privilege.rs`：报告 `uiaccess` / `elevated` / `integrity`，
+  写启动日志、设置页状态行与 `diagnostics` 报告。
+- `scripts/install-uiaaccess.ps1`、`scripts/setup-uiaaccess-local.ps1`、`docs/UIAACCESS.md`。
+- `docs/adr/0001-uiaaccess-for-cross-integrity-capture.md`：记录为什么签名本身不够。
+
+### 实测
+
+自签证书 + `%ProgramFiles%` 安装、非提权启动：`uiaccess=true elevated=false integrity=High`，
+并在以管理员身份运行的记事本里成功取词。
+
 ## [0.2.0] - 2026-10-25
 
 第二个版本，**首个公开发布**。标记为测试版：功能可用，但取词路径尚未在各家应用里逐项验证。

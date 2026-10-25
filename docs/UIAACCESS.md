@@ -144,8 +144,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-uiaaccess.ps
    启动日志里有一行 `log file:` 指出实际路径。
 
 2. **设置 → 关于**
-   应显示 `UIAccess: 已启用`（完整行类似 `UIAccess: 已启用 · 完整性: Medium`）。
+   应显示 `UIAccess: 已启用`（完整行类似 `UIAccess: 已启用 · 完整性: High`）。
    若显示「未启用」，说明没有拿到 token，按下一节排查。
+
+   > 注意完整性显示的是 **High** 而不是 Medium：UIAccess 进程会被系统提升到高完整性级别，
+   > 这正是它能跨过 UIPI 的原因。看到 `Medium` 就说明 UIAccess 没生效。
 
 3. **真实测试（必做）**
    1. 打开记事本：开始菜单搜索「记事本」→ 右键 → **以管理员身份运行**；
@@ -156,6 +159,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-uiaaccess.ps
 
    普通记事本里能取词**不能**证明 UIAccess 生效——那本来就不需要 UIAccess。
    只有在管理员窗口里也能取词，才说明跨完整性级别的合成输入被放行。
+
+### 实测结论（2026-10-25，Windows 11）
+
+用自签证书 + `%ProgramFiles%\dict-popup` 安装后，普通（非提权）启动，进程令牌为：
+
+```text
+elevated=False  uiaccess=True  integrityRid=0x3000 (High)
+```
+
+并**成功在“以管理员身份运行”的记事本里取到了词**。由此确认三件事：
+
+1. UIAccess 只由「签名 + Program Files + manifest」三项共同决定，与是否提权启动无关；
+2. UIAccess 会把进程提升到 **High** 完整性级别（`elevated=False` 也会）；
+3. 跨完整性级别的合成输入确实被放行——这正是 UIPI 拦截的反面。
+
+证书用自签即可（导入 `LocalMachine\Root`）；正式发布换成 SignPath Foundation 签名即可，
+机制完全相同。
 
 ## 失败排查表
 
