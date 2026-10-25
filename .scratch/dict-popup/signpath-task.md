@@ -21,6 +21,7 @@
 | 步骤 | 状态 | 备注 |
 |---|---|---|
 | 仓库公开 + MIT | ✅ 完成 | https://github.com/XJacket/dict-popup |
+| 首个公开版本 | ✅ 完成 | `v0.2.0`（pre-release，未签名），SHA-256 记录在 release notes |
 | CI 从源码构建产物 | ✅ 完成 | `.github/workflows/ci.yml` |
 | Release 工作流预留签名步骤 | ✅ 完成 | `.github/workflows/release.yml`，`if: false` |
 | 申请材料 | ✅ 完成 | `docs/SIGNPATH-APPLICATION.md` |
