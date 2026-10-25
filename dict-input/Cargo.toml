@@ -1,10 +1,11 @@
-﻿[package]
+[package]
 name = "dict-input"
 version = "0.1.0"
 edition = "2021"
 description = "Win32 input layer: global hotkey, UIA selection capture, tray icon, single instance"
 
 [dependencies]
+selection = "1.2.0"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

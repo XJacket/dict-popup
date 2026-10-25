@@ -22,7 +22,8 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::{CF_TEXT, CF_UNICODETEXT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
+    VK_SHIFT, VK_SPACE, VK_TAB,
 };
 
 use crate::selection::{Selection, SelectionError};
@@ -35,7 +36,20 @@ const OPEN_ATTEMPTS: usize = 8;
 
 /// Copy the current selection with `Ctrl+C` and return it, restoring the
 /// previous clipboard text afterwards.
+///
+/// Pot's own [`selection`] crate is tried first: it releases the modifier keys
+/// and restores the clipboard (text *and* image) the way Pot does, so whatever
+/// works there works here. Our own implementation runs second because it
+/// reports *why* it failed, which the crate cannot.
 pub(crate) fn capture() -> Result<Selection, SelectionError> {
+    let pot_text = selection::get_text();
+    if !pot_text.trim().is_empty() {
+        return Ok(Selection { text: pot_text });
+    }
+    capture_own()
+}
+
+fn capture_own() -> Result<Selection, SelectionError> {
     let sequence_before = unsafe { GetClipboardSequenceNumber() };
     let previous = read_text();
 
@@ -420,29 +434,38 @@ pub(crate) fn debug_press_combo(keys: &[u16]) {
 }
 
 pub(crate) fn send_ctrl_c() -> Result<(), SelectionError> {
-    // One SendInput call with Ctrl-down, C-down, C-up, Ctrl-up in a single
-    // array is acknowledged by the API but many applications coalesce it and
-    // never see the chord. Injecting the four events separately with a small
-    // gap is what a human typing the shortcut produces, and is recognised.
-    const GAP: Duration = Duration::from_millis(25);
+    // Exactly what Pot's `selection` crate does before copying, and the reason
+    // its clipboard path works after a hotkey: send an explicit key-up for every
+    // modifier and for C, so no stale "Ctrl+Alt is still down" state is left in
+    // the target's keyboard input, then press a clean Ctrl+C.
+    const RELEASE_FIRST: [VIRTUAL_KEY; 9] = [
+        VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_SPACE, VK_TAB, VK_ESCAPE, VK_CAPITAL,
+        VIRTUAL_KEY(b'C' as u16),
+    ];
 
-    for (key, up) in [
-        (VK_CONTROL, false),
-        (VIRTUAL_KEY(b'C' as u16), false),
-        (VIRTUAL_KEY(b'C' as u16), true),
-        (VK_CONTROL, true),
-    ] {
-        let inputs = [key_input(key, up)];
-        // SAFETY: `inputs` is one fully initialised INPUT of the declared size.
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent as usize != inputs.len() {
-            return Err(SelectionError::Automation(format!(
-                "无法发送 Ctrl+C（SendInput 返回 {sent}/1）"
-            )));
-        }
-        std::thread::sleep(GAP);
+    for key in RELEASE_FIRST {
+        send_one(key, true)?;
+        std::thread::sleep(Duration::from_millis(8));
     }
 
+    send_one(VK_CONTROL, false)?;
+    std::thread::sleep(Duration::from_millis(8));
+    send_one(VIRTUAL_KEY(b'C' as u16), false)?;
+    send_one(VIRTUAL_KEY(b'C' as u16), true)?;
+    send_one(VK_CONTROL, true)?;
+
+    Ok(())
+}
+
+fn send_one(key: VIRTUAL_KEY, up: bool) -> Result<(), SelectionError> {
+    let inputs = [key_input(key, up)];
+    // SAFETY: one fully initialised INPUT record of the declared size.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(SelectionError::Automation(format!(
+            "无法发送按键（SendInput 返回 {sent}/1）"
+        )));
+    }
     Ok(())
 }
 
