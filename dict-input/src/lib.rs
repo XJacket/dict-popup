@@ -66,3 +66,10 @@ pub fn debug_type_text(text: &str) -> usize {
 pub fn debug_capture_selection() -> Result<String, String> {
     host_impl::debug_capture_selection()
 }
+
+/// Press a key chord through SendInput (diagnostics only): the keys are virtual
+/// key codes, pressed in order and released in reverse.
+#[doc(hidden)]
+pub fn debug_press_combo(keys: &[u16]) {
+    host_impl::debug_press_combo(keys)
+}

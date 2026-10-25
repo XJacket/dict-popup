@@ -16,8 +16,10 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+use windows::Win32::System::Ole::{CF_TEXT, CF_UNICODETEXT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -53,8 +55,14 @@ pub(crate) fn capture() -> Result<Selection, SelectionError> {
         if unsafe { GetClipboardSequenceNumber() } != sequence_before {
             match read_text_detailed() {
                 Ok(text) => {
-                    captured = Some(text);
-                    break;
+                    // The sequence can move for unrelated reasons (another app,
+                    // a clipboard manager, our own earlier write). Text that is
+                    // identical to what was already there is not a copy.
+                    if previous.as_deref() != Some(text.as_str()) {
+                        captured = Some(text);
+                        break;
+                    }
+                    read_failure = Some("clipboard text unchanged by the copy");
                 }
                 Err(reason) => read_failure = Some(reason),
             }
@@ -72,8 +80,11 @@ pub(crate) fn capture() -> Result<Selection, SelectionError> {
                 if unsafe { GetClipboardSequenceNumber() } != sequence_before {
                     match read_text_detailed() {
                         Ok(text) => {
-                            captured = Some(text);
-                            break;
+                            if previous.as_deref() != Some(text.as_str()) {
+                                captured = Some(text);
+                                break;
+                            }
+                            read_failure = Some("clipboard text unchanged by the copy");
                         }
                         Err(reason) => read_failure = Some(reason),
                     }
@@ -182,9 +193,7 @@ pub(crate) fn read_text_detailed() -> Result<String, &'static str> {
             // SAFETY: balances the successful OpenClipboard above.
             let _ = unsafe { CloseClipboard() };
             return result.map_err(|reason| match reason {
-                ClipboardReadError::NoUnicodeText => "剪贴板里没有 CF_UNICODETEXT",
-                ClipboardReadError::LockFailed => "GlobalLock 失败",
-                ClipboardReadError::Empty => "剪贴板文本为空",
+                ClipboardReadError::NoUnicodeText => "剪贴板里没有文本（CF_UNICODETEXT/CF_TEXT 都不可用）",
             });
         }
         last_error = "OpenClipboard 一直被占用";
@@ -196,8 +205,6 @@ pub(crate) fn read_text_detailed() -> Result<String, &'static str> {
 
 enum ClipboardReadError {
     NoUnicodeText,
-    LockFailed,
-    Empty,
 }
 
 /// Replace the clipboard text. Best effort: failures are ignored on purpose
@@ -240,35 +247,103 @@ pub(crate) fn write_text(text: &str) {
 ///
 /// The clipboard must be open on this thread.
 unsafe fn read_clipboard_text() -> Result<String, ClipboardReadError> {
-    // SAFETY: the clipboard is open, so this returns the current text handle.
-    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
-        .map_err(|_| ClipboardReadError::NoUnicodeText)?;
-    let global = HGLOBAL(handle.0);
+    // Preferred: UTF-16 text.
+    if let Ok(handle) = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) } {
+        if let Some(text) = unsafe { read_utf16(handle) } {
+            return Ok(text);
+        }
+    }
 
+    // Clipboard managers and a few older applications publish ANSI text only.
+    // Accept it instead of reporting "no text".
+    if let Ok(handle) = unsafe { GetClipboardData(CF_TEXT.0 as u32) } {
+        if let Some(bytes) = unsafe { read_bytes(handle) } {
+            let text = decode_ansi(&bytes);
+            if !text.is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+
+    Err(ClipboardReadError::NoUnicodeText)
+}
+
+/// Copy a UTF-16 clipboard handle into a String, bounded by its allocation.
+///
+/// # Safety
+///
+/// The clipboard must be open; `handle` must come from it.
+unsafe fn read_utf16(handle: HANDLE) -> Option<String> {
+    let global = HGLOBAL(handle.0);
     // SAFETY: `global` is a text handle owned by the clipboard.
     let pointer = unsafe { GlobalLock(global) };
     if pointer.is_null() {
-        return Err(ClipboardReadError::LockFailed);
+        return None;
     }
-
-    // SAFETY: the block is a NUL-terminated UTF-16 string owned by the clipboard.
-    let mut length = 0usize;
+    // SAFETY: the scan is bounded by the real allocation; reading past it would
+    // corrupt the heap (`GlobalSize` is the only trustworthy bound).
     unsafe {
+        let capacity = GlobalSize(global) / std::mem::size_of::<u16>();
+        let limit = capacity.min(60_000);
         let wide = pointer as *const u16;
-        while *wide.add(length) != 0 {
+        let mut length = 0usize;
+        while length < limit && *wide.add(length) != 0 {
             length += 1;
-            if length > 60_000 {
-                break;
-            }
         }
-        let slice = std::slice::from_raw_parts(wide, length);
-        let text = String::from_utf16_lossy(slice);
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, length));
         let _ = GlobalUnlock(global);
         if text.is_empty() {
-            return Err(ClipboardReadError::Empty);
+            None
+        } else {
+            Some(text)
         }
-        Ok(text)
     }
+}
+
+/// Copy a raw clipboard handle into bytes, bounded and NUL-trimmed.
+///
+/// # Safety
+///
+/// The clipboard must be open; `handle` must come from it.
+unsafe fn read_bytes(handle: HANDLE) -> Option<Vec<u8>> {
+    let global = HGLOBAL(handle.0);
+    // SAFETY: `global` is a data handle owned by the clipboard.
+    let pointer = unsafe { GlobalLock(global) };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: bounded copy of the block.
+    unsafe {
+        let size = (GlobalSize(global) as usize).min(60_000);
+        let bytes = std::slice::from_raw_parts(pointer as *const u8, size);
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let owned = bytes[..end].to_vec();
+        let _ = GlobalUnlock(global);
+        if owned.is_empty() {
+            None
+        } else {
+            Some(owned)
+        }
+    }
+}
+
+fn decode_ansi(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::{
+        MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
+    };
+
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mut wide = vec![0u16; bytes.len() + 1];
+    // SAFETY: both buffers are valid for their declared lengths.
+    let written = unsafe {
+        MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut wide))
+    };
+    if written <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
 }
 
 /// Wait until Ctrl/Alt/Shift/Win are physically released (max 600 ms).
@@ -326,6 +401,22 @@ pub(crate) fn debug_type_text(text: &str) -> usize {
         std::thread::sleep(Duration::from_millis(20));
     }
     accepted
+}
+
+/// Diagnostic: press a virtual-key chord through `SendInput` (tests only).
+pub(crate) fn debug_press_combo(keys: &[u16]) {
+    for key in keys {
+        let input = [key_input(VIRTUAL_KEY(*key), false)];
+        // SAFETY: one fully initialised INPUT record of the declared size.
+        let _ = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for key in keys.iter().rev() {
+        let input = [key_input(VIRTUAL_KEY(*key), true)];
+        // SAFETY: as above.
+        let _ = unsafe { SendInput(&input, std::mem::size_of::<INPUT>() as i32) };
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub(crate) fn send_ctrl_c() -> Result<(), SelectionError> {

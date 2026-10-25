@@ -48,6 +48,10 @@ pub(crate) fn debug_type_text(text: &str) -> usize {
     clipboard::debug_type_text(text)
 }
 
+pub(crate) fn debug_press_combo(keys: &[u16]) {
+    clipboard::debug_press_combo(keys)
+}
+
 /// Run the clipboard capture once and return the text or the error message.
 pub(crate) fn debug_capture_selection() -> Result<String, String> {
     clipboard::capture()
