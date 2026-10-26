@@ -31,6 +31,11 @@
 | 开启 workflow 签名步骤 | ⬜ 待批准 | 两个 `if: false` → `if: true` |
 | 签名后验证普通权限取词 | ✅ **机制已验证**（2026-10-25，自签） | `uiaccess=true elevated=false integrity=High`，提权记事本取词成功；等 SignPath 正式签名复验 |
 
+最后检查：**2026-10-26 10:46**（automation task）——材料 `docs/SIGNPATH-APPLICATION.md` 与仓库现状一致：
+仓库 `XJacket/dict-popup`、MIT、`cmd /c build.bat` 产 `dist/dict-popup.exe`、工作流
+`.github/workflows/release.yml`、已有 release `v0.2.0`、HEAD `d28eb86`。当前阻塞点仍是
+**用户提交申请**。
+
 ## 每 12 小时应当做的事
 
 1. 读本文件，确认上表哪一步是当前阻塞点。
