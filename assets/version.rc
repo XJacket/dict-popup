@@ -25,8 +25,8 @@
 #endif
 
 1 VERSIONINFO
-  FILEVERSION     0,2,0,0
-  PRODUCTVERSION  0,2,0,0
+  FILEVERSION     0,2,1,0
+  PRODUCTVERSION  0,2,1,0
   FILEFLAGSMASK   0x3fL
   FILEFLAGS       0x0L
   FILEOS          VOS_NT_WINDOWS32
@@ -39,12 +39,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "XuJake"
       VALUE "FileDescription",  "离线划词词典"
-      VALUE "FileVersion",      "0.2.0.0"
+      VALUE "FileVersion",      "0.2.1.0"
       VALUE "InternalName",     "dict-popup"
       VALUE "LegalCopyright",   "© 2026 XuJake"
       VALUE "OriginalFilename", "dict-popup.exe"
       VALUE "ProductName",      "dict-popup"
-      VALUE "ProductVersion",   "0.2.0.0"
+      VALUE "ProductVersion",   "0.2.1.0"
     END
   END
   BLOCK "VarFileInfo"

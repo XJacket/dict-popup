@@ -1,10 +1,22 @@
 # 任务：获取代码签名证书（SignPath Foundation）
 
 - **Type:** task
-- **Status:** in-progress
+- **Status:** **blocked**（2026-10-26，用户当前无法申请）
 - **Started:** 2026-10-25
 - **Owner:** 用户（提交申请）+ agent（跟进、准备、验证）
-- **触发:** 每 12 小时由 automation task 唤醒一次，直到证书可用
+
+## 为什么 blocked
+
+用户确认**暂时无法为该项目申请到证书**。申请通道本身没有技术阻塞，缺的是能提交/通过审核的条件，
+不在 agent 能推进的范围内。
+
+**替代方案已落地并在本机验证**：自签名 + UIAccess，流程写在
+[README 的「本地自签名安装」](../../README.md#本地自签名安装启用-uiaccess)，
+证据见 [docs/adr/0001](../../docs/adr/0001-uiaaccess-for-cross-integrity-capture.md)。
+"能跨完整性级别取词"这件事**不依赖 SignPath**，只依赖本机自签。
+
+**恢复条件**：用户重新具备申请条件时，把 Status 改回 `in-progress`；
+申请材料见 `docs/SIGNPATH-APPLICATION.md`。
 
 ## 目标
 

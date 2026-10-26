@@ -445,14 +445,14 @@ dependencies = [
 
 [[package]]
 name = "dict-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "dict-input"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "selection",
  "windows 0.58.0",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "dict-popup"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dict-core",
  "dict-input",
