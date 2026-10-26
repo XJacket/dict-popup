@@ -198,14 +198,13 @@ pub struct CardPalette {
     pub headword: Color32,
     pub danger: Color32,
     pub warn: Color32,
-    pub shadow: Shadow,
 }
 
 pub fn card_palette(dark: bool) -> CardPalette {
     if dark {
         CardPalette {
             bg: Color32::from_rgba_unmultiplied(26, 27, 32, 243),
-            border: Color32::from_rgba_unmultiplied(72, 75, 88, 180),
+            border: Color32::from_rgba_unmultiplied(72, 75, 88, 200),
             text: Color32::from_rgb(233, 235, 242),
             muted: Color32::from_rgb(150, 154, 168),
             accent: Color32::from_rgba_unmultiplied(92, 132, 255, 46),
@@ -214,17 +213,11 @@ pub fn card_palette(dark: bool) -> CardPalette {
             headword: Color32::from_rgb(248, 249, 253),
             danger: Color32::from_rgb(255, 138, 128),
             warn: Color32::from_rgb(240, 196, 96),
-            shadow: Shadow {
-                offset: [0, 8],
-                blur: 22,
-                spread: 1,
-                color: Color32::from_black_alpha(130),
-            },
         }
     } else {
         CardPalette {
             bg: Color32::from_rgba_unmultiplied(252, 252, 253, 247),
-            border: Color32::from_rgba_unmultiplied(0, 0, 0, 28),
+            border: Color32::from_rgba_unmultiplied(0, 0, 0, 46),
             text: Color32::from_rgb(31, 32, 38),
             muted: Color32::from_rgb(108, 112, 124),
             accent: Color32::from_rgba_unmultiplied(72, 112, 235, 30),
@@ -233,12 +226,6 @@ pub fn card_palette(dark: bool) -> CardPalette {
             headword: Color32::from_rgb(16, 17, 22),
             danger: Color32::from_rgb(196, 48, 42),
             warn: Color32::from_rgb(158, 110, 12),
-            shadow: Shadow {
-                offset: [0, 8],
-                blur: 20,
-                spread: 1,
-                color: Color32::from_black_alpha(90),
-            },
         }
     }
 }

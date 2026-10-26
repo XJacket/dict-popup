@@ -6,6 +6,8 @@
 **离线划词词典，Windows 桌面小工具。** 选中任意程序里的文字，按一次热键，鼠标旁弹出释义卡片。
 不联网、不启动 GoldenDict、单文件 exe、零运行时依赖。
 
+**为什么做这个工具** 作者本人是一个英语学习者，在浏览网站时经常被不认识的单词卡住，想要一款好用的划词翻译工具。而现在市面上的主流工具都使用 离线 + 调用商用翻译接口 的形式实现，不但速度缓慢，影响阅读体验，还不提供单词的详细释义。于是我使用vibecoding构建了这个轻量化的翻译工具。它响应迅速，完全离线，并能显示全面的词典释义。
+
 > Offline word-lookup popup for Windows. Select text anywhere, press a hotkey, get a
 > floating card with the definition. No network, no runtime, one exe.
 

@@ -20,10 +20,16 @@ use crate::dictionaries::{LookupReport, QueryScript, Registry};
 use crate::request::{Outcome, State};
 use crate::theme::{self, CardPalette};
 
-/// Transparent border around the card, so the painted shadow has room and the
-/// rounded corners are not clipped by the window edge. The shadow reaches
-/// `offset + blur / 2 + spread` points, which must stay below this.
-pub const PAD: f32 = 20.0;
+/// Transparent margin around the card inside its window.
+///
+/// This used to be `20.0` so a painted drop shadow had room, but the shadow
+/// (offset 8, blur 20-22, spread 1) reached exactly the window edge and was
+/// clipped by it. The clip left a hard rectangular edge outside the card's own
+/// 1px stroke - two visible borders - and the transparent ring swallowed clicks
+/// that should have gone to the window underneath.
+///
+/// The window is now exactly the card: one border, exact hit area.
+pub const PAD: f32 = 0.0;
 /// Total fade-in time (DESIGN §5: 150 ms).
 pub const FADE_SECONDS: f32 = 0.15;
 /// Offset from the anchor cursor, in egui points (DESIGN §5).
@@ -248,7 +254,6 @@ pub fn show(ui: &mut egui::Ui, shared: &mut Shared) {
                 .fill(palette.bg)
                 .stroke(Stroke::new(1.0, palette.border))
                 .corner_radius(CornerRadius::same(12))
-                .shadow(palette.shadow)
                 .inner_margin(Margin::symmetric(16, 13));
 
             let response = frame.show(ui, |ui| {
