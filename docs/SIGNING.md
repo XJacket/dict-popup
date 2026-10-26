@@ -2,13 +2,29 @@
 
 ## 现状
 
-Release 二进制**未使用公共 CA 证书签名**。从源码构建或下载未签名 release 时，
+Release 二进制**没有公共 CA 的证书**。从源码构建或下载未签名 release 时，
 Windows 会提示"未知发布者 / 此应用已被阻止"，这是未签名开源软件的正常现象，
 可在提示中点「更多信息 → 仍要运行」。
 
 > 注意：如果 exe 被放在**低完整性**目录（某些沙箱、受限目录）里，Windows 不仅会提示
 > 未签名，还会阻止程序向其他程序发送按键（UIPI），导致取词失败。把程序放到普通目录
 > 即可。程序启动时会自检完整性级别并在设置页提示。
+
+## 目前可用的方案：本机自签名
+
+SignPath Foundation 的申请暂时拿不到，因此**当前推荐的自用路径是自签名**，
+完整流程在 [README 的「本地自签名安装」](../README.md#本地自签名安装启用-uiaccess)：
+
+1. `build.bat /uiaccess` 构建 UIAccess 变体
+2. `scripts\sign-release.ps1` 生成自签证书、装入当前用户存储并签名
+3. 以管理员身份把 `assets\signing\dict-popup-codesign.cer` 导入
+   **本地计算机**的「受信任的根证书颁发机构」（UIAccess 要求证书对本机受信任）
+4. `scripts\install-uiaaccess.ps1` 安装到 `%ProgramFiles%`
+
+一键版本：`scripts\setup-uiaaccess-local.ps1`（需管理员）。
+
+**只对本机有效**：换一台电脑，Windows 仍会提示未知发布者；把这个签名的 exe 带到
+别的机器上还会因 UIAccess 无法启动（`ERROR_ELEVATION_REQUIRED`, 740）。
 
 ## 计划：SignPath Foundation 免费开源签名
 
