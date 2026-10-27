@@ -140,9 +140,11 @@ build.bat
 dict-core/   StarDict 读取（mmap + 稀疏锚点索引）、方向指纹、查询回退链
 dict-input/  全局热键、托盘、单实例、取词（剪贴板 / UI Automation）
 dict-popup/  egui 界面：悬浮卡片、设置窗口、配置与查询编排
+dict-store/  词典包管理：库目录、版本与回退、校验、预留的下载接口（CLI 形态）
 ```
 
 细节见 [docs/DESIGN.md](docs/DESIGN.md)（接口契约与验收标准）。
+词典格式与免费词典的调研（下一版支持哪些、为什么）见 [docs/DICTIONARIES.md](docs/DICTIONARIES.md)。
 
 ## 已知限制
 

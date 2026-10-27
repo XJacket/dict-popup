@@ -41,6 +41,10 @@ jobs:
         shell: pwsh
         run: cargo test --release --manifest-path dict-popup/Cargo.toml
 
+      - name: Test dict-store
+        shell: pwsh
+        run: cargo test --release --manifest-path dict-store/Cargo.toml
+
       - name: Build release
         shell: pwsh
         run: |
