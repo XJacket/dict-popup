@@ -319,34 +319,114 @@ fn parse_ifo(text: &str) -> IfoInfo {
     }
 }
 
-/// Decode one `.dict` entry. For `sametypesequence=m` the bytes are plain
-/// UTF-8 text. Otherwise blocks are `type byte | payload`, NUL separated.
+/// Decode one `.dict` entry.
+///
+/// With `sametypesequence` set the entry carries **no** type byte per field: the
+/// fields appear in the listed order and every field except the last is
+/// NUL-terminated. Without it each field is `type byte | data` and the last one
+/// runs to the end of the entry.
 fn decode_entry(bytes: &[u8], sametypesequence: &str) -> String {
     let mut out = String::new();
 
-    if sametypesequence == "m" {
-        out.push_str(&String::from_utf8_lossy(bytes));
-    } else {
-        // Only plain-text types are rendered; anything else is skipped.
+    if sametypesequence.is_empty() {
         let mut rest = bytes;
         while !rest.is_empty() {
             let ty = rest[0];
-            let payload = &rest[1..];
-            let (chunk, tail) = match payload.iter().position(|&b| b == 0) {
-                Some(p) => (&payload[..p], &payload[p + 1..]),
-                None => (payload, &[][..]),
-            };
-            if ty == b'm' || ty == b'l' || ty == b'g' || ty == b'x' {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&String::from_utf8_lossy(chunk));
-            }
+            let (chunk, tail) = split_nul(&rest[1..]);
+            push_field(&mut out, ty, chunk);
+            rest = tail;
+        }
+    } else {
+        // "m" is the common case and falls out of this loop unchanged.
+        let types: Vec<u8> = sametypesequence.bytes().collect();
+        let mut rest = bytes;
+        for (i, ty) in types.iter().enumerate() {
+            let last = i + 1 == types.len();
+            let (chunk, tail) = if last { (rest, &[][..]) } else { split_nul(rest) };
+            push_field(&mut out, *ty, chunk);
             rest = tail;
         }
     }
 
     out.trim_matches('\u{feff}').trim().to_string()
+}
+
+fn split_nul(bytes: &[u8]) -> (&[u8], &[u8]) {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(p) => (&bytes[..p], &bytes[p + 1..]),
+        None => (bytes, &[][..]),
+    }
+}
+
+/// Append one field. Only text-like types are rendered; `h` is HTML and gets
+/// its markup removed because the card shows plain text.
+fn push_field(out: &mut String, ty: u8, chunk: &[u8]) {
+    if !matches!(ty, b'm' | b'l' | b'g' | b'x' | b't' | b'h') {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let text = String::from_utf8_lossy(chunk);
+    if ty == b'h' {
+        out.push_str(&strip_html(&text));
+    } else {
+        out.push_str(&text);
+    }
+}
+
+/// Drop HTML markup from a definition: tags removed, block-level tags become
+/// line breaks, a few entities decoded, whitespace squeezed. Not a parser —
+/// dictionary HTML is generated, not hand-written, so this is enough.
+fn strip_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                let mut tag = String::new();
+                for t in chars.by_ref() {
+                    if t == '>' {
+                        break;
+                    }
+                    tag.push(t);
+                }
+                let name = tag.trim_start_matches('/').trim().to_ascii_lowercase();
+                if name.starts_with("br")
+                    || name.starts_with('p')
+                    || name.starts_with("div")
+                    || name.starts_with("li")
+                {
+                    out.push('\n');
+                }
+            }
+            '&' => {
+                let mut entity = String::new();
+                for e in chars.by_ref() {
+                    if e == ';' || entity.len() == 8 {
+                        break;
+                    }
+                    entity.push(e);
+                }
+                out.push(match entity.as_str() {
+                    "amp" => '&',
+                    "lt" => '<',
+                    "gt" => '>',
+                    "quot" => '"',
+                    "apos" => '\'',
+                    "nbsp" => ' ',
+                    _ => ' ',
+                });
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Compare a dictionary headword against an already-lowercased query, using
@@ -434,6 +514,76 @@ mod tests {
             ("the", "art. 定冠词"),
             ("Zeal", "n. 热情"),
         ])
+    }
+
+    /// Like [`build_temp`], but with an explicit `sametypesequence` and raw
+    /// entry bytes, so the sequence encoding itself can be exercised.
+    fn build_temp_seq(sametypesequence: &str, entries: &[(&str, &[u8])]) -> TempDict {
+        let mut sorted: Vec<_> = entries.to_vec();
+        sorted.sort_by_key(|(w, _)| w.to_ascii_lowercase());
+
+        let mut idx = Vec::new();
+        let mut dict = Vec::new();
+        for (word, payload) in &sorted {
+            let offset = dict.len() as u32;
+            dict.extend_from_slice(payload);
+            idx.extend_from_slice(word.as_bytes());
+            idx.push(0);
+            idx.extend_from_slice(&offset.to_be_bytes());
+            idx.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        }
+
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        let dir = base.join(format!(
+            "dict-core-seq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stem = dir.join("seqdict");
+        std::fs::write(
+            stem.with_extension("ifo"),
+            format!(
+                "StarDict's dict ifo file\nversion=2.4.2\nwordcount={}\nidxfilesize={}\nbookname=seq\nsametypesequence={}\n",
+                sorted.len(),
+                idx.len(),
+                sametypesequence
+            ),
+        )
+        .unwrap();
+        std::fs::write(stem.with_extension("idx"), &idx).unwrap();
+        std::fs::write(stem.with_extension("dict"), &dict).unwrap();
+
+        TempDict { dir }
+    }
+
+    #[test]
+    fn html_sequence_has_no_type_byte_and_loses_tags() {
+        // sametypesequence=h: the entry is bare HTML, no leading type byte.
+        let t = build_temp_seq("h", &[("apple", b"<b>apple</b><br>\xe8\x8b\xb9\xe6\x9e\x9c")]);
+        let d = Dictionary::open(t.dir.join("seqdict.ifo")).unwrap();
+        assert_eq!(d.lookup_exact("apple").unwrap().definition, "apple\n苹果");
+    }
+
+    #[test]
+    fn multi_field_sequence_splits_on_nul() {
+        // sametypesequence=tm: "t" is NUL-terminated, the last field runs to the end.
+        let t = build_temp_seq("tm", &[("run", b"v.\x00\xe8\xb7\x91")]);
+        let d = Dictionary::open(t.dir.join("seqdict.ifo")).unwrap();
+        assert_eq!(d.lookup_exact("run").unwrap().definition, "v.\n跑");
+    }
+
+    #[test]
+    fn empty_sequence_keeps_type_tagged_entries() {
+        let t = build_temp_seq("", &[("apple", b"m\xe8\x8b\xb9\xe6\x9e\x9c\x00")]);
+        let d = Dictionary::open(t.dir.join("seqdict.ifo")).unwrap();
+        assert_eq!(d.lookup_exact("apple").unwrap().definition, "苹果");
     }
 
     #[test]
