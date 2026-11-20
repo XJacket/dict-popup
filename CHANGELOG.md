@@ -5,6 +5,21 @@
 格式参考 [Keep a Changelog 1.1.0](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-11-20
+
+### 修复
+
+- **带 `sametypesequence` 的 StarDict 词典解析为空**：`decode_entry` 只特判了 `"m"`，
+  其余按"类型字节 + NUL"读取，而设置了 `sametypesequence` 的条目**没有**类型字节。
+  FreeDict / WikDict 用 `h`（HTML），因此每个条目都解码成空串、查词必然落空。
+  现在按声明的类型序列切分字段（除最后一枚外均以 NUL 结尾），`h` 会去掉标签并把块级标签
+  转成换行；无序列的词典仍走原来的类型字节路径。
+
+### 说明
+
+- 用真实词典验证：FreeDict eng-zho（26,660 条）与 WikDict en-zh（27,250 条）可正常显示
+  音标与释义，单次查词 12–35 µs。
+
 ## [0.2.1] - 2026-10-26
 
 ### 修复
