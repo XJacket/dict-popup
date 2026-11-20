@@ -1,6 +1,6 @@
 [package]
 name = "dict-popup"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Offline dictionary lookup with a modern floating card"
 
